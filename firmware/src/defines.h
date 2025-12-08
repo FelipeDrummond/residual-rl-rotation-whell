@@ -1,0 +1,6 @@
+typedef struct{
+  double x1;
+  double x2;
+  double x3;
+  double x4;
+} estados_t;

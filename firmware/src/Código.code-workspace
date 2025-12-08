@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "Pendulo_roda_LQR",
+			"path": "C:/Users/gabri/OneDrive/Documentos/PlatformIO/Projects/Pendulo_roda_LQR"
+		},
+		{
+			"name": "Pendulo_rodo_LQR",
+			"path": ".."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"cmath": "cpp"
+		}
+	}
+}

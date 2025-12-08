@@ -1,0 +1,27 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"name": "Stewart",
+			"path": "../../../Ball and Plate (Stewart)/Códigos/Stewart"
+		},
+		{
+			"name": "ESP_Zion",
+			"path": "C:/Users/gabri/OneDrive/Documentos/PlatformIO/Projects/ESP_Zion"
+		},
+		{
+			"name": "Pendulo_rodo_LQR",
+			"path": "P:/Meu Drive/Projetos/Kits/Pêndulo Roda/Código/Pendulo_rodo_LQR"
+		},
+		{
+			"path": "../Docs"
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"cmath": "cpp"
+		}
+	}
+}

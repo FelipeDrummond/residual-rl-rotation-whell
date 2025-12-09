@@ -70,27 +70,34 @@ class ReactionWheelEnv(gym.Env):
         self.r = 0.1  # m - outer radius
         self.r_in = 0.0911  # m - inner radius
 
-        # Motor parameters
+        # Motor parameters (from MATLAB)
         self.tau_stall = 0.3136  # Nm
         self.i_stall = 1.8  # A
-        self.Rm = self.max_voltage / self.i_stall  # Motor resistance
-        self.Kt = self.tau_stall / self.i_stall  # Torque constant
+        self.Rm = self.max_voltage / self.i_stall  # Motor resistance (12V / 1.8A = 6.67 Ohm)
+        # Note: MATLAB uses Kt=0, Kv=0 (simplified model, no back-EMF)
+        # But we keep Kt for torque calculation
+        self.Kt = self.tau_stall / self.i_stall  # Torque constant (0.1742 Nm/A)
 
         # Inertias
         self.Jh = (1/3) * self.Mh * self.L**2  # Pendulum inertia
         self.Jr = (1/2) * self.Mr * (self.r**2 + self.r_in**2)  # Wheel inertia
 
-        # Damping (assumed minimal for now, can be tuned)
-        self.b1 = 0.0  # Pendulum damping
-        self.b2 = 0.0  # Wheel damping
+        # Damping coefficients (from MATLAB lambda.mat)
+        # Note: In MATLAB, b2 = 2*lambda*(Jh+Jr), and Kt=0, Kv=0
+        self.lambda_damping = 0.15060423  # Damping coefficient from system ID
+        self.b1 = 0.0  # Pendulum damping (no damping on pendulum, from MATLAB line 26)
+        self.b2 = 2 * self.lambda_damping * (self.Jh + self.Jr)  # Wheel damping (MATLAB line 27)
+        self.Kv = 0.0  # Back-EMF constant (set to 0 as in MATLAB line 30)
 
-        # Stribeck friction parameters (to be tuned based on real hardware)
+        # Stribeck friction parameters (RESEARCH: simulating plant degradation)
+        # NOTE: The real hardware does NOT have this friction - it's added to simulate
+        # degraded conditions and test the residual RL's ability to compensate
         if friction_params is None:
             self.friction_params = {
-                "Ts": 0.15,      # Static friction (Nm)
-                "Tc": 0.08,      # Coulomb friction (Nm)
-                "vs": 0.05,      # Stribeck velocity (rad/s)
-                "sigma": 0.02,   # Viscous friction coefficient
+                "Ts": 0.15,      # Static friction (Nm) - to be tuned
+                "Tc": 0.08,      # Coulomb friction (Nm) - to be tuned
+                "vs": 0.05,      # Stribeck velocity (rad/s) - to be tuned
+                "sigma": 0.02,   # Viscous friction coefficient - to be tuned
             }
         else:
             self.friction_params = friction_params
@@ -165,60 +172,78 @@ class ReactionWheelEnv(gym.Env):
         """
         return -np.dot(self.K, state)
 
-    def _dynamics(self, state: np.ndarray, u_total: float) -> np.ndarray:
+    def _dynamics(self, state: np.ndarray, u_normalized: float) -> np.ndarray:
         """
         Compute state derivatives for the coupled pendulum-wheel system with friction.
 
-        Equations of motion derived from Lagrangian mechanics:
-        (Mh*d + Mr*L)*L*θ̈ + Jr*α̈ = (Mh*d + Mr*L)*g*sin(θ) + τ_friction - τ_motor
-        Jr*α̈ + (Mh*d + Mr*L)*L*θ̈*cos(θ) = τ_motor - τ_friction
+        This implements the MATLAB state-space model with non-linear extension (sin(θ) instead
+        of θ) and added Stribeck friction on the wheel.
+
+        From MATLAB modelo_pendulo.m:
+        State: x = [theta, alpha, theta_dot, alpha_dot]'
+
+        Pendulum equation (row 3 of state derivative):
+        θ̈ = l_31*sin(θ) + l_33*θ̇ + l_34*α̇ + l_3*u
+        where:
+            l_31 = -(Mr*g*L + Mh*g*d)/(Mr*L² + Jh)
+            l_33 = -b1/(Mr*L² + Jh)
+            l_34 = (b2 + Kt*Kv/Rm)/(Mr*L² + Jh)
+            l_3 = -(12*Kt)/(Rm*(Mr*L² + Jh))
+
+        Wheel equation (row 4 of state derivative):
+        α̈ = l_41*sin(θ) + l_43*θ̇ + l_44*α̇ + l_4*u - τ_friction/Jr
+        where:
+            l_41 = (Mr*g*L + Mh*g*d)/(Mr*L² + Jh)
+            l_43 = b1/(Mr*L² + Jh)
+            l_44 = -((Mr*L² + Jh + Jr)*(b2 + Kt*Kv/Rm))/(Jr*(Mr*L² + Jh))
+            l_4 = (12*Kt*(Mr*L² + Jh + Jr))/(Rm*Jr*(Mr*L² + Jh))
 
         Args:
             state: [theta, alpha, theta_dot, alpha_dot]
-            u_total: Total control voltage (V)
+            u_normalized: Normalized control input (-1 to 1, will be scaled by 12V in equations)
 
         Returns:
             state_dot: [theta_dot, alpha_dot, theta_ddot, alpha_ddot]
         """
         theta, alpha, theta_dot, alpha_dot = state
 
-        # Motor torque (simplified model: τ = Kt * i = Kt * u / Rm)
-        tau_motor = (self.Kt / self.Rm) * u_total * 12.0  # Scale by max voltage
-
-        # Friction torque on wheel
+        # Friction torque on wheel (RESEARCH: added Stribeck friction)
         tau_friction = self._stribeck_friction(alpha_dot)
 
-        # Shorthand for common terms
+        # Shorthand for common terms (matching MATLAB notation)
         MrL2_Jh = self.Mr * self.L**2 + self.Jh
         MhgL_MrgL = self.Mh * self.g * self.d + self.Mr * self.g * self.L
 
-        # Mass matrix and force vector for the coupled system
-        # Using the linearized version from MATLAB as a starting point,
-        # but this is the full non-linear version
+        # Compute state-space matrix elements (from MATLAB lines 36-54)
+        # Note: Kt=0, Kv=0 in MATLAB, so (b2 + Kt*Kv/Rm) simplifies to b2
+        # However, l_3 and l_4 still use Kt for motor torque calculation
 
-        # Simplified non-linear equations (assuming small angle approximations can be relaxed)
-        # From the state-space in MATLAB, we can derive:
+        # Pendulum equation coefficients
+        l_31 = -MhgL_MrgL / MrL2_Jh
+        l_33 = -self.b1 / MrL2_Jh
+        l_34 = (self.b2 + self.Kt * self.Kv / self.Rm) / MrL2_Jh
+        l_3 = -(12.0 * self.Kt) / (self.Rm * MrL2_Jh)
 
-        # Pendulum equation:
-        # (Mr*L² + Jh)*θ̈ = (Mh*g*d + Mr*g*L)*sin(θ) - b1*θ̇ + (b2 + Kt*Kv/Rm)*α̇ - (Kt/Rm)*u*12
+        # Wheel equation coefficients
+        l_41 = MhgL_MrgL / MrL2_Jh
+        l_43 = self.b1 / MrL2_Jh
+        l_44 = -((MrL2_Jh + self.Jr) * (self.b2 + self.Kt * self.Kv / self.Rm)) / (self.Jr * MrL2_Jh)
+        l_4 = (12.0 * self.Kt * (MrL2_Jh + self.Jr)) / (self.Rm * self.Jr * MrL2_Jh)
 
-        # Wheel equation:
-        # Jr*α̈ = -(Mh*g*d + Mr*g*L)*sin(θ) + b1*θ̇ - ((Jr + Mr*L² + Jh)/Jr)*(b2 + Kt*Kv/Rm)*α̇ + ((Jr + Mr*L² + Jh)/Jr)*(Kt/Rm)*u*12
-
-        # For the coupled system with friction:
+        # State derivatives (non-linear version using sin(theta) instead of linearized theta)
         theta_ddot = (
-            MhgL_MrgL * np.sin(theta) / MrL2_Jh
-            - self.b1 * theta_dot / MrL2_Jh
-            + (self.b2 * self.Kt / self.Rm) * alpha_dot / MrL2_Jh
-            - (self.Kt / self.Rm) * u_total * 12.0 / MrL2_Jh
+            l_31 * np.sin(theta) +  # Non-linear gravity term
+            l_33 * theta_dot +
+            l_34 * alpha_dot +
+            l_3 * u_normalized  # u_normalized ∈ [-1, 1], scaled by 12V in l_3
         )
 
         alpha_ddot = (
-            -MhgL_MrgL * np.sin(theta) / self.Jr
-            + self.b1 * theta_dot / self.Jr
-            - ((self.Jr + MrL2_Jh) / self.Jr) * (self.b2 * self.Kt / self.Rm) * alpha_dot
-            + ((self.Jr + MrL2_Jh) / self.Jr) * (self.Kt / self.Rm) * u_total * 12.0
-            - tau_friction / self.Jr  # Friction acts on wheel
+            l_41 * np.sin(theta) +  # Non-linear gravity coupling
+            l_43 * theta_dot +
+            l_44 * alpha_dot +
+            l_4 * u_normalized -  # u_normalized ∈ [-1, 1], scaled by 12V in l_4
+            tau_friction / self.Jr  # Stribeck friction acts on wheel (RESEARCH addition)
         )
 
         return np.array([theta_dot, alpha_dot, theta_ddot, alpha_ddot])
@@ -309,7 +334,7 @@ class ReactionWheelEnv(gym.Env):
         # Extract residual action and scale it
         u_RL = float(action[0]) * self.residual_scale
 
-        # Compute LQR baseline control
+        # Compute LQR baseline control (returns voltage in range [-12V, +12V])
         u_LQR = self._lqr_control(self.state)
 
         # Total control signal (hybrid control)
@@ -318,8 +343,12 @@ class ReactionWheelEnv(gym.Env):
         # Saturate voltage to physical limits
         u_total = np.clip(u_total, -self.max_voltage, self.max_voltage)
 
-        # Integrate dynamics using RK4 for better accuracy
-        state_dot = self._dynamics(self.state, u_total)
+        # Normalize control signal to [-1, 1] for dynamics
+        # The dynamics equations expect normalized input (will be scaled by 12V internally)
+        u_normalized = u_total / self.max_voltage
+
+        # Integrate dynamics using Euler method
+        state_dot = self._dynamics(self.state, u_normalized)
 
         # Simple Euler integration (can be upgraded to RK4 if needed)
         self.state = self.state + state_dot * self.dt

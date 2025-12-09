@@ -62,6 +62,14 @@ Monitor training with TensorBoard:
 tensorboard --logdir ./logs/
 ```
 
+**Learning Curves:**
+The training script automatically generates learning curve plots showing:
+- Episode rewards over time with moving average
+- Episode lengths over time
+- Training statistics
+
+The plot is saved to `models/ppo_residual/learning_curve.png` and updated periodically during training.
+
 ## Validation
 
 Compare LQR vs Hybrid (LQR + RL) control:

@@ -180,8 +180,13 @@ u_total = clip(u_total, -12V, +12V)
 
 **Physics Implementation:**
 - Non-linear equations of motion for coupled pendulum-wheel system
-- Stribeck friction model: `F = (Tc + (Ts - Tc)*exp(-|ω|/vs))*sign(ω) + σ*ω`
-- Default friction params: Ts=0.15, Tc=0.08, vs=0.05, sigma=0.02 (tunable)
+- Linear damping from MATLAB system ID:
+  - `b1 = 0` (no pendulum damping)
+  - `b2 = 2*λ*(Jh+Jr) ≈ 0.000703 N⋅m⋅s/rad` (wheel damping, λ=0.15060423)
+- **Stribeck friction** (RESEARCH - simulates plant degradation):
+  - `F = (Tc + (Ts - Tc)*exp(-|ω|/vs))*sign(ω) + σ*ω`
+  - Default params: Ts=0.15, Tc=0.08, vs=0.05, sigma=0.02 (tunable)
+  - **Note:** Real hardware works fine without this - added to test RL compensation
 - RK4 integration for accuracy at dt=0.02s
 
 **Reward Function (MRAC-based):**

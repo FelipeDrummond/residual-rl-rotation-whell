@@ -24,6 +24,7 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecNormalize
 
 from simulation.envs import ReactionWheelEnv
+from simulation.plotting_callback import PlottingCallback
 
 
 def get_device(force_cpu: bool = False) -> str:
@@ -197,7 +198,15 @@ def train(
         render=False,
     )
 
-    callbacks = CallbackList([checkpoint_callback, eval_callback])
+    # Plotting callback for learning curves
+    plotting_callback = PlottingCallback(
+        save_path=save_path,
+        plot_freq=eval_freq,  # Update plot at same frequency as evaluation
+        window_size=100,
+        verbose=1,
+    )
+
+    callbacks = CallbackList([checkpoint_callback, eval_callback, plotting_callback])
 
     # Train the model
     print("\nStarting training...")

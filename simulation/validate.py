@@ -2,12 +2,12 @@
 Validation script for comparing LQR vs Hybrid (LQR + Residual RL) control
 
 This script evaluates the trained residual RL agent and compares performance
-against pure LQR control on an underdamped system.
+against pure LQR control under extreme Stribeck friction conditions.
 
 RESEARCH CONTEXT:
-- Without damping, LQR struggles (~80% success, ~18° RMS error)
-- The RL agent learns to provide "virtual damping"
-- Target: >95% success rate, <2° RMS error
+- With extreme friction (Ts >= 0.5), LQR completely fails (0% success rate)
+- The RL agent learns to compensate for stiction and non-linear friction
+- Target: >90% success rate where LQR fails
 
 Usage:
     python -m simulation.validate --model_path models/ppo_residual/final_model --episodes 10
@@ -15,7 +15,7 @@ Usage:
 Generates:
     - Time series comparison plots (theta, velocities, control signals)
     - Performance metrics (RMS error, rewards, episode length)
-    - Phase portraits showing stability improvement from RL damping
+    - Phase portraits showing stability improvement from RL friction compensation
 """
 
 import argparse

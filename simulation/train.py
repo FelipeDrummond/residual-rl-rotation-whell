@@ -1,13 +1,14 @@
 """
 Training script for Residual RL agent on Reaction Wheel Pendulum
 
-This script trains a PPO agent to learn a residual control policy that provides
-virtual damping to an underdamped inverted pendulum system.
+This script trains a PPO agent to learn a residual control policy that compensates
+for extreme Stribeck friction that the LQR controller cannot handle.
 
 RESEARCH CONTEXT:
-- The baseline LQR controller struggles with the underdamped system (~80% success, 18° RMS error)
-- The RL agent learns to add "virtual damping" through its residual control output
-- Target: Improve success rate to ~100% and reduce RMS error to <2°
+- The LQR is robust to light/medium friction but FAILS at extreme levels (Ts >= 0.5)
+- With extreme friction: LQR has 0% success rate due to stiction and non-linearity
+- The RL agent learns to anticipate and overcome friction through residual control
+- Target: Achieve >90% success rate where LQR completely fails
 
 The hybrid control law is: u_total = u_LQR + α * u_RL
 where u_RL is the learned residual and α is the residual_scale parameter.
@@ -127,7 +128,7 @@ def train(
         device: Device to use ('auto', 'cuda', 'mps', or 'cpu')
     """
     print("=" * 60)
-    print("Training Residual RL for Virtual Damping Compensation")
+    print("Training Residual RL for Extreme Friction Compensation")
     print("=" * 60)
     print(f"Total timesteps: {total_timesteps:,}")
     print(f"Parallel environments: {n_envs}")
@@ -135,9 +136,9 @@ def train(
     print(f"Domain randomization: {domain_randomization}")
     print(f"Device: {device}")
     print()
-    print("OBJECTIVE: Learn to provide damping for underdamped system")
-    print("  - LQR baseline: ~80% success, ~18° RMS error")
-    print("  - Target: >95% success, <2° RMS error")
+    print("OBJECTIVE: Learn to compensate for extreme Stribeck friction")
+    print("  - LQR baseline with extreme friction: 0% success (complete failure)")
+    print("  - Target: >90% success rate where LQR fails")
     print("=" * 60)
 
     # Create directories

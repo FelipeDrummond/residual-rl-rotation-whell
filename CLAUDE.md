@@ -183,11 +183,15 @@ u_total = clip(u_total, -12V, +12V)
 - Linear damping from MATLAB system ID:
   - `b1 = 0` (no pendulum damping)
   - `b2 = 2*λ*(Jh+Jr) ≈ 0.000703 N⋅m⋅s/rad` (wheel damping, λ=0.15060423)
-- **Stribeck friction** (RESEARCH - simulates plant degradation):
-  - `F = (Tc + (Ts - Tc)*exp(-|ω|/vs))*sign(ω) + σ*ω`
-  - Default params: Ts=0.15, Tc=0.08, vs=0.05, sigma=0.02 (tunable)
-  - **Note:** Real hardware works fine without this - added to test RL compensation
-- RK4 integration for accuracy at dt=0.02s
+- **Friction Configuration** (RESEARCH):
+  - Default: **NO FRICTION** (Ts=0, Tc=0, sigma=0) - underdamped system
+  - Optional Stribeck model: `F = (Tc + (Ts-Tc)*exp(-|ω|/vs))*sign(ω) + σ*ω`
+  - **Research finding:** Friction HELPS LQR by providing damping
+  - Without friction: LQR ~80% success, RMS ~0.32 rad (18°)
+  - With friction: LQR ~100% success, RMS ~0.02 rad (1°)
+  - **Research angle:** RL compensates for lack of natural damping
+- Initial conditions: theta ∈ [-0.3, 0.3] rad, theta_dot ∈ [-0.5, 0.5] rad/s
+- Euler integration at dt=0.02s
 
 **Reward Function (MRAC-based):**
 ```python

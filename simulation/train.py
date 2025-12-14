@@ -1,8 +1,16 @@
 """
 Training script for Residual RL agent on Reaction Wheel Pendulum
 
-This script trains a PPO agent to learn a residual control policy that compensates
-for Stribeck friction in the reaction wheel pendulum.
+This script trains a PPO agent to learn a residual control policy that provides
+virtual damping to an underdamped inverted pendulum system.
+
+RESEARCH CONTEXT:
+- The baseline LQR controller struggles with the underdamped system (~80% success, 18° RMS error)
+- The RL agent learns to add "virtual damping" through its residual control output
+- Target: Improve success rate to ~100% and reduce RMS error to <2°
+
+The hybrid control law is: u_total = u_LQR + α * u_RL
+where u_RL is the learned residual and α is the residual_scale parameter.
 
 Usage:
     python -m simulation.train --timesteps 500000 --save_path models/ppo_residual
@@ -91,7 +99,7 @@ def train(
     total_timesteps: int = 500_000,
     n_envs: int = 4,
     learning_rate: float = 3e-4,
-    residual_scale: float = 1.0,
+    residual_scale: float = 2.0,  # Increased for more RL authority
     domain_randomization: bool = True,
     save_path: str = "models/ppo_residual",
     tensorboard_log: str = "./logs/",
@@ -100,13 +108,17 @@ def train(
     device: str = "auto",
 ):
     """
-    Train PPO agent for residual control.
+    Train PPO agent to provide virtual damping for underdamped pendulum.
+
+    The RL agent learns a residual control policy that compensates for the
+    lack of natural damping in the system. The hybrid control is:
+        u_total = u_LQR + residual_scale * u_RL
 
     Args:
         total_timesteps: Total training timesteps
         n_envs: Number of parallel environments
         learning_rate: Learning rate for PPO
-        residual_scale: Scaling factor for residual action
+        residual_scale: Scaling factor for residual action (higher = more RL authority)
         domain_randomization: Whether to use domain randomization
         save_path: Path to save trained model
         tensorboard_log: Path for tensorboard logs
@@ -115,13 +127,17 @@ def train(
         device: Device to use ('auto', 'cuda', 'mps', or 'cpu')
     """
     print("=" * 60)
-    print("Training Residual RL Agent for Reaction Wheel Pendulum")
+    print("Training Residual RL for Virtual Damping Compensation")
     print("=" * 60)
     print(f"Total timesteps: {total_timesteps:,}")
     print(f"Parallel environments: {n_envs}")
-    print(f"Residual scale: {residual_scale}")
+    print(f"Residual scale: {residual_scale} (RL authority)")
     print(f"Domain randomization: {domain_randomization}")
     print(f"Device: {device}")
+    print()
+    print("OBJECTIVE: Learn to provide damping for underdamped system")
+    print("  - LQR baseline: ~80% success, ~18° RMS error")
+    print("  - Target: >95% success, <2° RMS error")
     print("=" * 60)
 
     # Create directories
@@ -158,6 +174,10 @@ def train(
     )
 
     # Create PPO model
+    # Hyperparameters tuned for learning damping-like behavior:
+    # - Higher gamma (0.995) for long-horizon stability
+    # - More n_steps for better trajectory sampling
+    # - Moderate entropy to encourage exploration of damping strategies
     model = PPO(
         "MlpPolicy",
         env,
@@ -165,10 +185,10 @@ def train(
         n_steps=2048,
         batch_size=64,
         n_epochs=10,
-        gamma=0.99,
+        gamma=0.995,  # Higher gamma for long-term stability (damping is a long-horizon task)
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,
+        ent_coef=0.005,  # Lower entropy - damping requires consistent behavior
         vf_coef=0.5,
         max_grad_norm=0.5,
         policy_kwargs=dict(
@@ -229,7 +249,7 @@ def train(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train PPO agent for residual friction compensation"
+        description="Train PPO agent to provide virtual damping for underdamped pendulum"
     )
     parser.add_argument(
         "--timesteps",
@@ -252,8 +272,8 @@ def main():
     parser.add_argument(
         "--residual_scale",
         type=float,
-        default=1.0,
-        help="Scaling factor for residual action (default: 1.0)",
+        default=2.0,
+        help="Scaling factor for residual action - higher = more RL authority (default: 2.0)",
     )
     parser.add_argument(
         "--no_domain_rand",

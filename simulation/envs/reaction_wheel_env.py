@@ -14,6 +14,14 @@ import gymnasium as gym
 from gymnasium import spaces
 from typing import Optional, Tuple, Dict, Any
 
+from simulation.config import (
+    PHYSICAL_PARAMS,
+    ENV_CONFIG,
+    REWARD_CONFIG,
+    FrictionParams,
+    ChallengeConfig,
+)
+
 
 class ReactionWheelEnv(gym.Env):
     """
@@ -28,119 +36,101 @@ class ReactionWheelEnv(gym.Env):
     Action: Residual control signal (scalar)
         - The agent outputs a residual u_RL that is added to the base LQR controller
 
-    Physical Parameters (from MATLAB system identification):
-        - g = 9.81 m/s²
-        - Mh = 0.149 kg (pendulum mass)
-        - Mr = 0.144 kg (wheel mass)
-        - L = 0.14298 m (pendulum COM to pivot)
-        - d = 0.0987 m
-        - Motor stall torque = 0.3136 Nm @ 1.8A
-        - Max voltage = 12V
+    Physical parameters are loaded from simulation.config.PHYSICAL_PARAMS.
+    Challenge configurations are loaded from simulation.config.ChallengeConfig.
     """
 
     metadata = {"render_modes": ["human"], "render_fps": 50}
 
     def __init__(
         self,
-        dt: float = 0.02,  # 50 Hz control frequency
-        max_voltage: float = 12.0,
-        residual_scale: float = 1.0,  # Scaling factor alpha for residual action
+        dt: float = None,
+        max_voltage: float = None,
+        residual_scale: float = 1.0,
         friction_params: Optional[Dict[str, float]] = None,
         domain_randomization: bool = False,
         randomization_factor: float = 0.1,
+        lqr_gain_scale: float = None,
+        observation_noise_std: float = None,
+        disturbance_std: float = None,
+        challenge_config: Optional[ChallengeConfig] = None,
         render_mode: Optional[str] = None,
     ):
+        """
+        Initialize the environment.
+
+        Args:
+            dt: Control timestep (default from ENV_CONFIG)
+            max_voltage: Maximum motor voltage (default from PHYSICAL_PARAMS)
+            residual_scale: Scaling factor for RL action
+            friction_params: Dict with Ts, Tc, vs, sigma (or use challenge_config)
+            domain_randomization: Whether to randomize parameters each episode
+            randomization_factor: ±factor variation for randomization
+            lqr_gain_scale: LQR gain scaling (or use challenge_config)
+            observation_noise_std: Noise on theta observation (or use challenge_config)
+            disturbance_std: External disturbance on theta_dot (or use challenge_config)
+            challenge_config: ChallengeConfig object (overrides individual params)
+            render_mode: Rendering mode
+        """
         super().__init__()
 
-        self.dt = dt
-        self.max_voltage = max_voltage
+        # Use challenge_config if provided, otherwise use individual params or defaults
+        if challenge_config is not None:
+            self.lqr_gain_scale = challenge_config.lqr_gain_scale
+            self.observation_noise_std = challenge_config.observation_noise_std
+            self.disturbance_std = challenge_config.disturbance_std
+            self.friction_params = challenge_config.friction.to_dict()
+        else:
+            self.lqr_gain_scale = lqr_gain_scale if lqr_gain_scale is not None else 1.0
+            self.observation_noise_std = observation_noise_std if observation_noise_std is not None else 0.0
+            self.disturbance_std = disturbance_std if disturbance_std is not None else 0.0
+            if friction_params is not None:
+                self.friction_params = friction_params
+            else:
+                self.friction_params = FrictionParams.moderate().to_dict()
+
+        # Store base friction for domain randomization
+        self._base_friction_Ts = self.friction_params["Ts"]
+
+        # Environment parameters
+        self.dt = dt if dt is not None else ENV_CONFIG.dt
+        self.max_voltage = max_voltage if max_voltage is not None else PHYSICAL_PARAMS.max_voltage
         self.residual_scale = residual_scale
         self.domain_randomization = domain_randomization
         self.randomization_factor = randomization_factor
         self.render_mode = render_mode
 
-        # Physical parameters (from MATLAB system ID)
-        self.g = 9.81  # m/s²
-        self.Mh = 0.149  # kg - pendulum mass
-        self.Mr = 0.144  # kg - wheel mass
-        self.L = 0.14298  # m - pendulum length (COM to pivot)
-        self.d = 0.0987  # m
-
-        # Wheel geometry
-        self.r = 0.1  # m - outer radius
-        self.r_in = 0.0911  # m - inner radius
-
-        # Motor parameters (from MATLAB)
-        self.tau_stall = 0.3136  # Nm
-        self.i_stall = 1.8  # A
-        self.Rm = self.max_voltage / self.i_stall  # Motor resistance (12V / 1.8A = 6.67 Ohm)
-        # Note: MATLAB uses Kt=0, Kv=0 (simplified model, no back-EMF)
-        # But we keep Kt for torque calculation
-        self.Kt = self.tau_stall / self.i_stall  # Torque constant (0.1742 Nm/A)
-
-        # Inertias
-        self.Jh = (1/3) * self.Mh * self.L**2  # Pendulum inertia
-        self.Jr = (1/2) * self.Mr * (self.r**2 + self.r_in**2)  # Wheel inertia
-
-        # Damping coefficients (from MATLAB lambda.mat)
-        # Note: In MATLAB, b2 = 2*lambda*(Jh+Jr), and Kt=0, Kv=0
-        self.lambda_damping = 0.15060423  # Damping coefficient from system ID
-        self.b1 = 0.0  # Pendulum damping (no damping on pendulum, from MATLAB line 26)
-        self.b2 = 2 * self.lambda_damping * (self.Jh + self.Jr)  # Wheel damping (MATLAB line 27)
-        self.Kv = 0.0  # Back-EMF constant (set to 0 as in MATLAB line 30)
-
-        # Stribeck friction parameters (RESEARCH: friction compensation)
-        #
-        # RESEARCH CONTEXT: With corrected inverted pendulum dynamics, there's a
-        # sharp transition in LQR performance:
-        # - Ts ≤ 0.456: LQR succeeds 100%
-        # - Ts ≥ 0.458: LQR fails completely (0% success)
-        #
-        # RESEARCH ANGLE: Test RL's ability to compensate for Stribeck friction
-        # at the threshold where LQR starts to struggle.
-        #
-        # Default: Moderate friction at the LQR failure threshold
-        # With domain randomization, Ts will vary around this point
-        if friction_params is None:
-            self.friction_params = {
-                "Ts": 0.46,     # At the LQR failure threshold
-                "Tc": 0.276,    # Coulomb friction (0.6 * Ts)
-                "vs": 0.1,      # Stribeck velocity
-                "sigma": 0.138, # Viscous friction coefficient (0.3 * Ts)
-            }
-        else:
-            self.friction_params = friction_params
+        # Physical parameters (from config)
+        self.g = PHYSICAL_PARAMS.g
+        self.Mh = PHYSICAL_PARAMS.Mh
+        self.Mr = PHYSICAL_PARAMS.Mr
+        self.L = PHYSICAL_PARAMS.L
+        self.d = PHYSICAL_PARAMS.d
+        self.r = PHYSICAL_PARAMS.r
+        self.r_in = PHYSICAL_PARAMS.r_in
+        self.tau_stall = PHYSICAL_PARAMS.tau_stall
+        self.i_stall = PHYSICAL_PARAMS.i_stall
+        self.Rm = PHYSICAL_PARAMS.Rm
+        self.Kt = PHYSICAL_PARAMS.Kt
+        self.Jh = PHYSICAL_PARAMS.Jh
+        self.Jr = PHYSICAL_PARAMS.Jr
+        self.lambda_damping = PHYSICAL_PARAMS.lambda_damping
+        self.b1 = PHYSICAL_PARAMS.b1
+        self.b2 = PHYSICAL_PARAMS.b2
+        self.Kv = 0.0  # Back-EMF constant (set to 0 as in MATLAB)
 
         # LQR gains - computed for INVERTED pendulum (theta=0 upright)
-        #
-        # These gains were computed using LQR with Q=diag([100, 0, 10, 0.1]), R=1
-        # for the correct inverted pendulum dynamics where gravity is destabilizing.
-        #
-        # Control law: u = -K @ state (voltage output)
-        #
-        # Sign analysis for motor torque:
-        # - l_3 = -(12*Kt)/(Rm*MrL2_Jh) is NEGATIVE
-        # - Positive voltage → negative theta_ddot (motor opposes displacement)
-        # - For theta > 0, we need negative theta_ddot (restoring)
-        # - So we need positive voltage when theta > 0
-        # - u = -K @ state, so K must be NEGATIVE for positive u when theta > 0
-        #
-        # Closed-loop eigenvalues: [-25.5, -4.3±1.7j, ~0] - stable and well-damped
-        self.K = np.array([-50.0, 0.0, -6.45, -0.34])
+        base_K = np.array([-50.0, 0.0, -6.45, -0.34])
+        self.K = self.lqr_gain_scale * base_K
 
         # State limits for observation space
-        # theta: [-pi, pi], alpha: unbounded but normalized, velocities: reasonable limits
-        max_theta_dot = 10.0  # rad/s
-        max_alpha_dot = 50.0  # rad/s (wheel spins faster)
-
         self.observation_space = spaces.Box(
-            low=np.array([-np.pi, -np.inf, -max_theta_dot, -max_alpha_dot]),
-            high=np.array([np.pi, np.inf, max_theta_dot, max_alpha_dot]),
+            low=np.array([-np.pi, -np.inf, -ENV_CONFIG.max_theta_dot, -ENV_CONFIG.max_alpha_dot]),
+            high=np.array([np.pi, np.inf, ENV_CONFIG.max_theta_dot, ENV_CONFIG.max_alpha_dot]),
             dtype=np.float32,
         )
 
-        # Action space: residual control signal (will be scaled and added to LQR)
-        # Normalized to [-1, 1], then scaled by residual_scale
+        # Action space: residual control signal [-1, 1], scaled by residual_scale
         self.action_space = spaces.Box(
             low=-1.0,
             high=1.0,
@@ -151,7 +141,7 @@ class ReactionWheelEnv(gym.Env):
         # State variables
         self.state = None
         self.steps = 0
-        self.max_steps = 500  # 10 seconds at 50Hz
+        self.max_steps = ENV_CONFIG.max_steps
 
         # For rendering
         self.screen = None
@@ -161,57 +151,35 @@ class ReactionWheelEnv(gym.Env):
         """
         Compute Stribeck friction torque as a function of angular velocity.
 
-        This implements an enhanced Stribeck model with features that challenge LQR:
-        1. Standard Stribeck curve: F = (Tc + (Ts-Tc)*exp(-|ω|/vs))*sign(ω) + σ*ω
-        2. Asymmetric friction: slightly different friction in each direction
-        3. Velocity-dependent static friction: harder to start from rest
-
-        The asymmetry and non-linearity cannot be compensated by linear control.
+        Standard Stribeck model:
+            F = (Tc + (Ts-Tc)*exp(-|ω|/vs))*sign(ω) + σ*ω
 
         Args:
             omega: Angular velocity (rad/s)
-            applied_torque: Motor torque being applied (used for breakaway calculation)
+            applied_torque: Motor torque being applied (used for stiction calculation)
 
         Returns:
-            Friction torque (Nm) - opposes motion with non-linear characteristics
+            Friction torque (Nm) - opposes motion
         """
         Ts = self.friction_params["Ts"]
         Tc = self.friction_params["Tc"]
         vs = self.friction_params["vs"]
         sigma = self.friction_params["sigma"]
 
-        # Asymmetry factor: friction is slightly higher in positive direction
-        # This creates a bias that LQR cannot compensate for
-        asymmetry = 0.15  # 15% asymmetry
-
         # Handle near-zero velocity case (stiction region)
-        stiction_threshold = 0.05  # rad/s
+        stiction_threshold = 0.01  # rad/s - very small threshold
         if abs(omega) < stiction_threshold:
-            # Enhanced stiction: increases friction near zero velocity
-            # This creates "sticky" behavior that causes limit cycles
-            stiction_boost = (1.0 - abs(omega) / stiction_threshold) * 0.5  # Up to 50% boost
-            effective_Ts = Ts * (1.0 + stiction_boost)
-
-            # At rest: friction opposes applied torque up to effective_Ts
-            if abs(applied_torque) <= effective_Ts:
-                # Add small random perturbation to break symmetry
-                return applied_torque * 0.95  # Slight energy loss
+            # At rest: friction opposes applied torque up to Ts
+            if abs(applied_torque) <= Ts:
+                return applied_torque  # Static friction matches applied torque
             else:
-                return effective_Ts * np.sign(applied_torque)
+                return Ts * np.sign(applied_torque)  # Breakaway
 
-        # Standard Stribeck friction model (always opposes motion)
+        # Standard Stribeck friction model
         sign_omega = np.sign(omega)
 
-        # Apply asymmetry: higher friction for positive omega
-        if omega > 0:
-            effective_Ts = Ts * (1.0 + asymmetry)
-            effective_Tc = Tc * (1.0 + asymmetry)
-        else:
-            effective_Ts = Ts * (1.0 - asymmetry * 0.5)  # Slightly less asymmetry for negative
-            effective_Tc = Tc * (1.0 - asymmetry * 0.5)
-
         # Stribeck curve: high at low speeds, drops to Tc at high speeds
-        stribeck_term = effective_Tc + (effective_Ts - effective_Tc) * np.exp(-abs(omega) / vs)
+        stribeck_term = Tc + (Ts - Tc) * np.exp(-abs(omega) / vs)
 
         # Viscous friction (linear with velocity)
         viscous_term = sigma * omega
@@ -221,9 +189,9 @@ class ReactionWheelEnv(gym.Env):
 
     def _lqr_control(self, state: np.ndarray) -> float:
         """
-        Compute LQR control signal.
+        Compute LQR control signal with optional observation noise.
 
-        u_LQR = -K · x
+        u_LQR = -K · x_noisy
 
         Args:
             state: [theta, alpha, theta_dot, alpha_dot]
@@ -231,6 +199,12 @@ class ReactionWheelEnv(gym.Env):
         Returns:
             Control voltage (V)
         """
+        # Add observation noise to simulate sensor errors
+        if self.observation_noise_std > 0:
+            noisy_state = state.copy()
+            noisy_state[0] += self.np_random.normal(0, self.observation_noise_std)  # theta noise
+            noisy_state[2] += self.np_random.normal(0, self.observation_noise_std * 10)  # theta_dot noise
+            return -np.dot(self.K, noisy_state)
         return -np.dot(self.K, state)
 
     def _dynamics(self, state: np.ndarray, u_normalized: float) -> np.ndarray:
@@ -372,26 +346,23 @@ class ReactionWheelEnv(gym.Env):
         factor = self.randomization_factor
 
         # Randomize masses
-        self.Mh = 0.149 * self.np_random.uniform(1 - factor, 1 + factor)
-        self.Mr = 0.144 * self.np_random.uniform(1 - factor, 1 + factor)
+        self.Mh = PHYSICAL_PARAMS.Mh * self.np_random.uniform(1 - factor, 1 + factor)
+        self.Mr = PHYSICAL_PARAMS.Mr * self.np_random.uniform(1 - factor, 1 + factor)
 
         # Randomize lengths
-        self.L = 0.14298 * self.np_random.uniform(1 - factor, 1 + factor)
-        self.d = 0.0987 * self.np_random.uniform(1 - factor, 1 + factor)
+        self.L = PHYSICAL_PARAMS.L * self.np_random.uniform(1 - factor, 1 + factor)
+        self.d = PHYSICAL_PARAMS.d * self.np_random.uniform(1 - factor, 1 + factor)
 
         # Recalculate inertias
         self.Jh = (1/3) * self.Mh * self.L**2
         self.Jr = (1/2) * self.Mr * (self.r**2 + self.r_in**2)
 
-        # Randomize friction parameters for domain randomization
-        # Use friction range that spans the LQR success/failure transition
-        # LQR threshold: Ts ≈ 0.457 (100% success below, 0% above)
-        # Range [0.38, 0.52] gives ~40-50% LQR success with learnable episodes
-        base_Ts = 0.45  # Center near the transition
-        self.friction_params["Ts"] = base_Ts * self.np_random.uniform(0.85, 1.15)  # [0.38, 0.52]
-        self.friction_params["Tc"] = self.friction_params["Ts"] * 0.6  # Tc = 0.6 * Ts
-        self.friction_params["vs"] = 0.1 * self.np_random.uniform(0.9, 1.1)  # [0.09, 0.11]
-        self.friction_params["sigma"] = self.friction_params["Ts"] * 0.3  # sigma = 0.3 * Ts
+        # Randomize friction parameters around the configured baseline
+        # Uses _base_friction_Ts stored at init, randomized by ±15%
+        self.friction_params["Ts"] = self._base_friction_Ts * self.np_random.uniform(0.85, 1.15)
+        self.friction_params["Tc"] = self.friction_params["Ts"] * 0.6
+        self.friction_params["vs"] = 0.1 * self.np_random.uniform(0.9, 1.1)
+        self.friction_params["sigma"] = self.friction_params["Ts"] * 0.3
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """
@@ -429,11 +400,15 @@ class ReactionWheelEnv(gym.Env):
         # Simple Euler integration (can be upgraded to RK4 if needed)
         self.state = self.state + state_dot * self.dt
 
+        # Add external disturbance (random push on pendulum)
+        if self.disturbance_std > 0:
+            self.state[2] += self.np_random.normal(0, self.disturbance_std)
+
         # Normalize pendulum angle to [-pi, pi]
         self.state[0] = self._normalize_angle(self.state[0])
 
-        # Compute reward (MRAC-based: penalize deviation from ideal behavior)
-        reward = self._compute_reward(self.state, u_LQR, u_RL)
+        # Compute reward (penalize deviation from ideal behavior)
+        reward = self._compute_reward(self.state, u_RL)
 
         # Check termination conditions
         terminated = self._is_terminated(self.state)
@@ -452,47 +427,45 @@ class ReactionWheelEnv(gym.Env):
 
         return self.state.astype(np.float32), reward, terminated, truncated, info
 
-    def _compute_reward(self, state: np.ndarray, u_LQR: float, u_RL: float) -> float:
+    def _compute_reward(self, state: np.ndarray, u_RL: float) -> float:
         """
-        MRAC-based reward: penalize deviation from ideal reference behavior.
+        Reward function balancing stabilization and control effort.
 
-        The ideal reference model is the frictionless LQR-controlled system.
-        We penalize:
-        1. State deviation from upright equilibrium
-        2. Control effort (especially residual)
-        3. Large velocities
+        Uses weights from REWARD_CONFIG.
 
         Args:
             state: Current state [theta, alpha, theta_dot, alpha_dot]
-            u_LQR: LQR control signal
             u_RL: Residual RL control signal
 
         Returns:
             reward: Scalar reward
         """
-        theta, alpha, theta_dot, alpha_dot = state
+        theta, _, theta_dot, alpha_dot = state
 
         # Penalize angle deviation from upright (theta = 0)
-        angle_cost = theta**2
+        angle_cost = REWARD_CONFIG.angle_weight * theta**2
 
         # Penalize angular velocities
-        velocity_cost = 0.1 * (theta_dot**2 + 0.01 * alpha_dot**2)
+        velocity_cost = REWARD_CONFIG.velocity_weight * theta_dot**2
+        velocity_cost += REWARD_CONFIG.wheel_velocity_weight * alpha_dot**2
 
-        # Penalize residual control effort (encourage minimal intervention)
-        control_cost = 0.01 * u_RL**2
+        # Control effort penalty
+        control_cost = REWARD_CONFIG.control_weight * u_RL**2
 
         # Total reward (negative cost)
         reward = -(angle_cost + velocity_cost + control_cost)
 
         # Bonus for staying upright
-        if abs(theta) < 0.1:
-            reward += 1.0
+        if abs(theta) < REWARD_CONFIG.upright_threshold:
+            reward += REWARD_CONFIG.upright_bonus
 
         return reward
 
     def _is_terminated(self, state: np.ndarray) -> bool:
         """
         Check if episode should terminate due to failure.
+
+        Uses limits from ENV_CONFIG.
 
         Args:
             state: Current state
@@ -503,11 +476,11 @@ class ReactionWheelEnv(gym.Env):
         theta, _, theta_dot, _ = state
 
         # Terminate if pendulum falls too far
-        if abs(theta) > np.pi / 3:  # More than 60 degrees from upright
+        if abs(theta) > ENV_CONFIG.theta_limit:
             return True
 
         # Terminate if spinning too fast (unstable)
-        if abs(theta_dot) > 15.0:
+        if abs(theta_dot) > ENV_CONFIG.theta_dot_limit:
             return True
 
         return False

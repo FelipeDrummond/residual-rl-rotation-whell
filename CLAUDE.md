@@ -4,11 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **Residual Reinforcement Learning** project for friction compensation in a Reaction Wheel Inverted Pendulum. The system uses a hybrid control architecture where an LQR controller handles nominal linear dynamics, and an RL agent (PPO) compensates for non-linear Stribeck friction.
+This is a **Residual Reinforcement Learning** project for virtual damping in a Reaction Wheel Inverted Pendulum. The system uses a hybrid control architecture where an LQR controller handles stabilization, and an RL agent (PPO) provides learned virtual damping to reduce oscillations.
 
 **Control Law:** `u_total(t) = u_LQR(t) + α · π_θ(s_t)`
 
-The workflow is **Sim-to-Real**: train a PPO agent in a Python digital twin (Gymnasium environment) that reproduces Stribeck friction, then deploy to ESP32 hardware.
+**Research Insight:** The underdamped LQR (moderate gains) stabilizes the pendulum but exhibits significant oscillations. Physical friction helps by providing natural damping, but is unreliable. The RL agent learns virtual damping (`u_RL ∝ -ω`) that is controllable and predictable.
+
+The workflow is **Sim-to-Real**: train a PPO agent in a Python digital twin (Gymnasium environment) to provide virtual damping, then deploy to ESP32 hardware.
 
 ## Repository Structure
 
@@ -183,13 +185,15 @@ u_total = clip(u_total, -12V, +12V)
 - Linear damping from MATLAB system ID:
   - `b1 = 0` (no pendulum damping)
   - `b2 = 2*λ*(Jh+Jr) ≈ 0.000703 N⋅m⋅s/rad` (wheel damping, λ=0.15060423)
-- **Friction Configuration** (RESEARCH):
-  - Default: **NO FRICTION** (Ts=0, Tc=0, sigma=0) - underdamped system
-  - Optional Stribeck model: `F = (Tc + (Ts-Tc)*exp(-|ω|/vs))*sign(ω) + σ*ω`
-  - **Research finding:** Friction HELPS LQR by providing damping
-  - Without friction: LQR ~80% success, RMS ~0.32 rad (18°)
-  - With friction: LQR ~100% success, RMS ~0.02 rad (1°)
-  - **Research angle:** RL compensates for lack of natural damping
+- **Damping Configuration** (RESEARCH):
+  - Default: **NO FRICTION** - creates underdamped system for RL training
+  - Optional Stribeck model available for comparison studies
+  - **Research finding:** Friction HELPS LQR by providing damping!
+  - **Research scenario (scale=0.35 LQR gains):**
+    - Without friction: 100% success, ~3° RMS (oscillatory)
+    - With friction: 100% success, ~1.3° RMS (damped)
+    - Optimal LQR (scale=1.0): ~0.9° RMS (target)
+  - **Research angle:** RL learns virtual damping (`u_RL ∝ -ω`) to match optimal LQR
 - Initial conditions: theta ∈ [-0.3, 0.3] rad, theta_dot ∈ [-0.5, 0.5] rad/s
 - Euler integration at dt=0.02s
 
@@ -212,6 +216,23 @@ bonus = +1.0 if |theta| < 0.1 rad
 
 ## Research Context
 
-This work is for a research paper: **"Hybrid Control for Reaction Wheel Pendulums: Non-Linear Friction Compensation via Residual Reinforcement Learning"**
+This work is for a research paper: **"Hybrid Control for Reaction Wheel Pendulums: Virtual Damping via Residual Reinforcement Learning"**
 
-The core problem being solved: Standard LQR fails to stabilize the physical pendulum due to Stribeck friction causing limit cycle oscillations. The RL agent learns to estimate and cancel this non-linearity, allowing the LQR to operate on an effectively linearized plant.
+**The Core Problem:**
+LQR controllers with moderate gains create underdamped systems with oscillatory transient response. Physical friction can help provide damping, but it's unreliable (varies with temperature, wear, etc.) and not precisely controllable.
+
+**The Solution:**
+Train an RL agent to provide virtual damping: `u_RL(ω) ∝ -ω`. This is:
+1. Controllable and predictable (unlike physical friction)
+2. A simple, interpretable function (easy to verify and deploy)
+3. Complementary to LQR (LQR stabilizes, RL damps)
+
+**Expected Results:**
+- Underdamped LQR alone: 100% survival, ~3° RMS (oscillatory)
+- Hybrid (LQR + RL): 100% survival, <1° RMS (matches optimal LQR)
+
+**Why This is Compelling:**
+1. Genuine problem (underdamped oscillations are common in control)
+2. LQR is essential (handles the hard stabilization task)
+3. RL role is clear (learns damping, not full control)
+4. Practical benefit (more reliable than mechanical friction)

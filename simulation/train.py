@@ -1,17 +1,29 @@
 """
-Training script for Residual RL agent on Reaction Wheel Pendulum
+Training script for Residual RL Virtual Damping
 
-This script trains a PPO agent to learn a residual control policy that compensates
-for extreme Stribeck friction that the LQR controller cannot handle.
+This script trains a PPO agent to provide virtual damping for an underdamped
+reaction wheel pendulum. The key insight is that LQR with moderate gains
+creates an underdamped system with oscillatory transient response.
 
 RESEARCH CONTEXT:
-- The LQR is robust to light/medium friction but FAILS at extreme levels (Ts >= 0.5)
-- With extreme friction: LQR has 0% success rate due to stiction and non-linearity
-- The RL agent learns to anticipate and overcome friction through residual control
-- Target: Achieve >90% success rate where LQR completely fails
+- Moderate LQR gains (scale=0.35) stabilize but result in underdamped response
+- The system oscillates significantly during transients
+- Physical friction helps (provides damping) but is unreliable
+- RL learns VIRTUAL DAMPING: u_RL(ω) ∝ -ω (velocity-proportional)
+- This is controllable, predictable, and doesn't depend on mechanical wear
 
 The hybrid control law is: u_total = u_LQR + α * u_RL
-where u_RL is the learned residual and α is the residual_scale parameter.
+where u_RL is the learned virtual damping and α is the residual_scale.
+
+Why this is compelling:
+1. Genuine problem: Underdamped oscillations are a real control challenge
+2. LQR still essential: Handles stabilization (the hard part)
+3. RL role is clear: Learns damping (a simple, interpretable function)
+4. Practical benefit: More reliable than physical friction
+
+Expected Results:
+- LQR alone: 100% survival, ~2-4° RMS due to oscillations
+- Hybrid (LQR+RL): 100% survival, <1° RMS (RL provides damping)
 
 Usage:
     python -m simulation.train --timesteps 500000 --save_path models/ppo_residual
@@ -19,7 +31,6 @@ Usage:
 
 import argparse
 import os
-from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -34,6 +45,7 @@ from stable_baselines3.common.vec_env import VecNormalize
 
 from simulation.envs import ReactionWheelEnv
 from simulation.plotting_callback import PlottingCallback
+from simulation.config import ChallengeConfig, TRAINING_CONFIG
 
 
 def get_device(force_cpu: bool = False) -> str:
@@ -68,8 +80,9 @@ def get_device(force_cpu: bool = False) -> str:
 def make_env(
     rank: int,
     seed: int = 0,
-    residual_scale: float = 1.0,
-    domain_randomization: bool = True,
+    residual_scale: float = TRAINING_CONFIG.residual_scale,
+    domain_randomization: bool = TRAINING_CONFIG.domain_randomization,
+    challenge_config: ChallengeConfig = None,
 ):
     """
     Create a single environment instance.
@@ -79,17 +92,20 @@ def make_env(
         seed: Random seed
         residual_scale: Scaling factor for residual action
         domain_randomization: Whether to use domain randomization
+        challenge_config: Challenge configuration (default: combined_challenges)
 
     Returns:
         Callable that creates the environment
     """
+    if challenge_config is None:
+        challenge_config = ChallengeConfig.combined_challenges()
+
     def _init():
         env = ReactionWheelEnv(
-            dt=0.02,
-            max_voltage=12.0,
             residual_scale=residual_scale,
             domain_randomization=domain_randomization,
-            randomization_factor=0.1,
+            randomization_factor=TRAINING_CONFIG.randomization_factor,
+            challenge_config=challenge_config,
         )
         env.reset(seed=seed + rank)
         return env
@@ -97,11 +113,11 @@ def make_env(
 
 
 def train(
-    total_timesteps: int = 500_000,
-    n_envs: int = 4,
-    learning_rate: float = 3e-4,
-    residual_scale: float = 2.0,  # Increased for more RL authority
-    domain_randomization: bool = True,
+    total_timesteps: int = TRAINING_CONFIG.total_timesteps,
+    n_envs: int = TRAINING_CONFIG.n_envs,
+    learning_rate: float = TRAINING_CONFIG.learning_rate,
+    residual_scale: float = TRAINING_CONFIG.residual_scale,
+    domain_randomization: bool = TRAINING_CONFIG.domain_randomization,
     save_path: str = "models/ppo_residual",
     tensorboard_log: str = "./logs/",
     eval_freq: int = 10_000,
@@ -109,10 +125,9 @@ def train(
     device: str = "auto",
 ):
     """
-    Train PPO agent to provide virtual damping for underdamped pendulum.
+    Train PPO agent to improve LQR performance under challenging conditions.
 
-    The RL agent learns a residual control policy that compensates for the
-    lack of natural damping in the system. The hybrid control is:
+    The RL agent learns a residual control policy. The hybrid control is:
         u_total = u_LQR + residual_scale * u_RL
 
     Args:
@@ -127,18 +142,26 @@ def train(
         checkpoint_freq: Frequency of checkpoint saves
         device: Device to use ('auto', 'cuda', 'mps', or 'cpu')
     """
+    # Get challenge config - underdamped LQR scenario
+    challenge_config = ChallengeConfig.underdamped_lqr()
+
     print("=" * 60)
-    print("Training Residual RL for Extreme Friction Compensation")
+    print("Training Residual RL for Virtual Damping")
     print("=" * 60)
     print(f"Total timesteps: {total_timesteps:,}")
     print(f"Parallel environments: {n_envs}")
-    print(f"Residual scale: {residual_scale} (RL authority)")
+    print(f"Residual scale: {residual_scale}V (virtual damping authority)")
     print(f"Domain randomization: {domain_randomization}")
     print(f"Device: {device}")
     print()
-    print("OBJECTIVE: Learn to compensate for extreme Stribeck friction")
-    print("  - LQR baseline with extreme friction: 0% success (complete failure)")
-    print("  - Target: >90% success rate where LQR fails")
+    print("LQR Configuration (underdamped):")
+    print(f"  - Gain scale: {challenge_config.lqr_gain_scale} (moderate → underdamped)")
+    print(f"  - Friction: None (training without physical friction)")
+    print()
+    print("RESEARCH OBJECTIVE: Learn virtual damping u_RL(omega) ~ -k*omega")
+    print("  - LQR alone: 100% survival but oscillatory (~2-4 deg RMS)")
+    print("  - Target: Provide damping, achieve <1 deg RMS error")
+    print("  - The RL learns a function similar to friction, but controllable")
     print("=" * 60)
 
     # Create directories
@@ -148,7 +171,12 @@ def train(
 
     # Create vectorized training environment
     env = make_vec_env(
-        lambda: make_env(0, residual_scale=residual_scale, domain_randomization=domain_randomization)(),
+        lambda: make_env(
+            0,
+            residual_scale=residual_scale,
+            domain_randomization=domain_randomization,
+            challenge_config=challenge_config,
+        )(),
         n_envs=n_envs,
     )
 
@@ -163,7 +191,12 @@ def train(
 
     # Create separate eval environment (without domain randomization for consistent evaluation)
     eval_env = make_vec_env(
-        lambda: make_env(0, residual_scale=residual_scale, domain_randomization=False)(),
+        lambda: make_env(
+            0,
+            residual_scale=residual_scale,
+            domain_randomization=False,
+            challenge_config=challenge_config,
+        )(),
         n_envs=1,
     )
     eval_env = VecNormalize(
@@ -174,31 +207,30 @@ def train(
         training=False,  # Don't update normalization stats during eval
     )
 
-    # Create PPO model
-    # Hyperparameters tuned for learning damping-like behavior:
-    # - Higher gamma (0.995) for long-horizon stability
-    # - More n_steps for better trajectory sampling
-    # - Moderate entropy to encourage exploration of damping strategies
+    # Create PPO model with hyperparameters from config
     model = PPO(
         "MlpPolicy",
         env,
         learning_rate=learning_rate,
-        n_steps=2048,
-        batch_size=64,
-        n_epochs=10,
-        gamma=0.995,  # Higher gamma for long-term stability (damping is a long-horizon task)
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.005,  # Lower entropy - damping requires consistent behavior
-        vf_coef=0.5,
-        max_grad_norm=0.5,
+        n_steps=TRAINING_CONFIG.n_steps,
+        batch_size=TRAINING_CONFIG.batch_size,
+        n_epochs=TRAINING_CONFIG.n_epochs,
+        gamma=TRAINING_CONFIG.gamma,
+        gae_lambda=TRAINING_CONFIG.gae_lambda,
+        clip_range=TRAINING_CONFIG.clip_range,
+        ent_coef=TRAINING_CONFIG.ent_coef,
+        vf_coef=TRAINING_CONFIG.vf_coef,
+        max_grad_norm=TRAINING_CONFIG.max_grad_norm,
         policy_kwargs=dict(
-            net_arch=dict(pi=[64, 64], vf=[64, 64]),  # Small network for ESP32 deployment
-            activation_fn=nn.Tanh,  # Use tanh for easier fixed-point conversion
+            net_arch=dict(
+                pi=list(TRAINING_CONFIG.policy_layers),
+                vf=list(TRAINING_CONFIG.value_layers),
+            ),
+            activation_fn=nn.Tanh,  # Tanh for easier fixed-point conversion
         ),
         verbose=1,
         tensorboard_log=tensorboard_log,
-        device=device,  # Use specified device (cuda/mps/cpu)
+        device=device,
     )
 
     # Callbacks
@@ -250,7 +282,7 @@ def train(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train PPO agent to provide virtual damping for underdamped pendulum"
+        description="Train PPO agent to provide virtual damping for underdamped reaction wheel pendulum"
     )
     parser.add_argument(
         "--timesteps",
@@ -274,7 +306,7 @@ def main():
         "--residual_scale",
         type=float,
         default=2.0,
-        help="Scaling factor for residual action - higher = more RL authority (default: 2.0)",
+        help="Max voltage for virtual damping (default: 2.0V)",
     )
     parser.add_argument(
         "--no_domain_rand",

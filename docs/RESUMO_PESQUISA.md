@@ -4,7 +4,7 @@
 
 Pêndulos invertidos com roda de reação sofrem com atrito de Stribeck (stiction) nos rolamentos da roda. Em baixas velocidades angulares, o atrito estático cria uma **zona morta** onde o torque motor comandado pelo controlador LQR é insuficiente para mover a roda. A roda permanece travada, o pêndulo deriva, e o desempenho do controle se degrada — mesmo com ganhos LQR otimamente ajustados.
 
-No nosso sistema, o stiction (Ts=0.08 Nm) degrada o LQR ótimo de **0.24° RMS** (sem atrito) para **0.90° RMS** — um aumento de 3.75× no erro em regime permanente. Importante: isso não pode ser resolvido ajustando os ganhos LQR de forma mais agressiva — o problema é uma zona morta não-linear, não uma questão de ganho linear.
+No nosso sistema, o stiction (Ts=0.15 Nm) degrada o LQR ótimo de **0.22° RMS** (sem atrito) para **0.90° RMS** — um aumento de 4× no erro. Importante: isso não pode ser resolvido ajustando os ganhos LQR de forma mais agressiva — o problema é uma zona morta não-linear, não uma questão de ganho linear.
 
 ## Abordagem: Aprendizado por Reforço Residual
 
@@ -25,7 +25,7 @@ O gêmeo digital utiliza parâmetros físicos da identificação de sistema no M
 - Pêndulo: Mh=0.149 kg, L=0.143 m, Jh=1.015e-3 kg·m²
 - Roda: Mr=0.144 kg, Jr=1.317e-3 kg·m²
 - Motor: 12V DC, Rm=6.67 Ω, Kt=0.174 Nm/A, **Kv=0.285 V/(rad/s)**
-- Atrito de Stribeck: Ts=0.08 Nm, Tc=0.048 Nm, vs=0.02 rad/s
+- Atrito de Stribeck: Ts=0.15 Nm, Tc=0.09 Nm, vs=0.02 rad/s
 - O atrito é propriamente acoplado às equações do pêndulo e da roda via a matriz de massa inversa (terceira lei de Newton)
 - Integração: RK4 com 10 sub-passos por período de controle de 20ms
 

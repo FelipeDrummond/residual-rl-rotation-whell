@@ -297,15 +297,22 @@ def plot_comparison(
         hybrid_residuals = hybrid_results["residuals"][0]
         hybrid_frictions = hybrid_results["frictions"][0]
 
-        # Plot residual action vs friction torque (what RL is compensating for)
-        axes[2, 0].plot(time_hybrid, hybrid_residuals, label="RL Residual u_RL", color="C1", linewidth=2)
+        # Convert RL voltage to torque for fair comparison: τ_RL = Kt * V_RL / Rm
+        from simulation.config import PHYSICAL_PARAMS as _PP
+        tau_RL = hybrid_residuals * _PP.Kt / _PP.Rm
+
+        axes[2, 0].plot(time_hybrid, tau_RL, label="RL Torque (Kt·u_RL/Rm)", color="C1", linewidth=2)
         axes[2, 0].plot(time_hybrid, hybrid_frictions, label="Friction Torque τ_f", color="C3", linewidth=1.5, alpha=0.7)
-        axes[2, 0].set_ylabel("Torque/Voltage", fontsize=11)
+        axes[2, 0].axhline(_PP.Kt * TRAINING_CONFIG.residual_scale / _PP.Rm, color="C1",
+                           linestyle=':', linewidth=1, alpha=0.4, label=f"Max RL torque ({_PP.Kt * TRAINING_CONFIG.residual_scale / _PP.Rm:.3f} Nm)")
+        axes[2, 0].axhline(-_PP.Kt * TRAINING_CONFIG.residual_scale / _PP.Rm, color="C1",
+                           linestyle=':', linewidth=1, alpha=0.4)
+        axes[2, 0].set_ylabel("Torque (Nm)", fontsize=11)
         axes[2, 0].set_xlabel("Time (s)")
-        axes[2, 0].legend(loc='upper right')
+        axes[2, 0].legend(loc='lower right', fontsize=9)
         axes[2, 0].grid(True, alpha=0.3)
         axes[2, 0].axhline(0, color='k', linestyle=':', linewidth=1, alpha=0.5)
-        axes[2, 0].set_title("RL Residual vs Friction Torque")
+        axes[2, 0].set_title("RL Torque vs Friction Torque")
 
     # Performance comparison bar chart
     lqr_rms = [np.sqrt(np.mean(states[:, 0]**2)) for states in lqr_results["states"]]

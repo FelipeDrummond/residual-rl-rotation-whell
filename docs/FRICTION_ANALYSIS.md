@@ -214,36 +214,74 @@ With friction:
 
 ---
 
-## New Research Angle: Virtual Damping
+## Current Research Angle: Stiction Compensation
 
-Instead of trying to make friction a *problem* for LQR, we leverage this insight:
+After fixing the physics model (friction coupling on both equations + RK4), we pivot from virtual damping to **stiction compensation**:
 
-**The RL agent learns to provide VIRTUAL DAMPING that replaces physical friction.**
+**The RL agent learns supplemental torque to overcome stiction dead zones.**
 
-### Why This is Better
+### Physics Model Fix (Phase 5)
 
-| Aspect | Physical Friction | Virtual Damping (RL) |
-|--------|------------------|---------------------|
-| Reliability | Varies with temp, wear | Consistent |
-| Controllability | Fixed by mechanics | Learnable, tunable |
-| Predictability | Hard to model exactly | Defined by network |
-| Deployment | Requires hardware | Software update |
+The original friction model had two bugs:
+1. Missing pendulum reaction (Newton's third law at bearing)
+2. Wrong wheel coupling (simple -τ_f/Jr instead of mass matrix)
+
+After fix: friction properly couples through inverse mass matrix M^(-1):
+```
+theta_ddot += +tau_f / MrL2_Jh
+alpha_ddot += -tau_f * (MrL2_Jh + Jr) / (Jr * MrL2_Jh)
+```
+
+### Friction Sweep (Corrected Physics, Optimal LQR scale=1.0)
+
+| Ts (Nm) | RMS Error | Survival | Notes |
+|---------|-----------|----------|-------|
+| 0.00 | 0.78° | 100% | No-friction baseline |
+| 0.05 | 0.85° | 100% | Mild degradation |
+| 0.10 | 1.02° | 100% | Moderate |
+| **0.15** | **1.19°** | **100%** | **Research operating point** |
+| 0.20 | 1.45° | 100% | Significant |
+| 0.25 | ~2.0° | ~95% | Near failure |
+
+### Stiction Dead Zone Analysis
+
+The dead zone is the angle range where LQR torque < Ts (wheel stuck):
+
+| Ts (Nm) | Dead zone (LQR alone) | Dead zone (LQR + 4V RL) | Reduction |
+|---------|-----------------------|--------------------------|-----------|
+| 0.10 | θ < 4.4° | θ < 1.3° | 70% |
+| **0.15** | **θ < 6.6°** | **θ < 2.0°** | **70%** |
+| 0.20 | θ < 8.8° | θ < 2.6° | 70% |
+
+### RL Authority Analysis
+
+How residual_scale affects the dead zone at Ts=0.15:
+
+| residual_scale (V) | Dead zone | Notes |
+|--------------------|-----------|-------|
+| 0 (LQR only) | θ < 6.6° | Baseline |
+| 2 | θ < 4.4° | Some improvement |
+| **4** | **θ < 2.0°** | **Chosen: good trade-off** |
+| 6 | θ < 0.9° | RL dominates too much |
+
+### Why Ts=0.15 and residual_scale=4V
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Ts | 0.15 Nm | Large enough to degrade LQR (0.78°→1.19°), small enough for 100% survival |
+| Tc | 0.09 Nm | Standard 0.6×Ts |
+| vs | 0.02 rad/s | Sharp stiction (realistic bearing) |
+| sigma | 0.0 | Isolates stiction effect |
+| residual_scale | 4V | Reduces dead zone 70% without overwhelming LQR |
+| lqr_gain_scale | 1.0 | Full optimal gains (no artificial weakening) |
 
 ### Configuration
 
 | Parameter | Value | Reason |
 |-----------|-------|--------|
-| `lqr_gain_scale` | 0.35 | Underdamped without friction |
-| `friction` | None | Isolate the damping problem |
-| `residual_scale` | 2.0 | RL authority for damping |
-
-### Expected RL Output
-
-The RL should learn approximately:
-```
-u_RL(state) ≈ -k * omega_wheel
-```
-This is equivalent to viscous friction, providing the damping the underdamped LQR needs.
+| `lqr_gain_scale` | 1.0 | Optimal LQR (reviewer-proof) |
+| `friction` | Ts=0.15, Tc=0.09, vs=0.02 | Stiction dead zone |
+| `residual_scale` | 4.0 | Overcome stiction |
 
 ---
 
@@ -255,11 +293,11 @@ This is equivalent to viscous friction, providing the damping the underdamped LQ
 
 3. **Control effort is a key metric** - Maximum effort solutions are not useful
 
-4. **Friction can be beneficial** - Don't assume nonlinearities are always problems
+4. **Fix the physics first** - Friction coupling bugs led to wrong conclusions
 
-5. **Virtual damping is learnable** - Simple function RL can actually learn
+5. **Stiction dead zones are genuine** - Real problem in mechanical control systems
 
-6. **Match sim and real** - Physical friction will exist in hardware anyway
+6. **Don't weaken the baseline** - Using optimal LQR makes the research reviewer-proof
 
 ---
 
@@ -268,12 +306,12 @@ This is equivalent to viscous friction, providing the damping the underdamped LQ
 To reproduce friction experiments:
 
 ```bash
-# Run friction sweep with the new tuning script
-python -m simulation.tune_friction --ts_min 0.02 --ts_max 0.15 --n_points 10 --plot
+# Run friction sweep around research operating point
+python -m simulation.tune_friction --ts_min 0.10 --ts_max 0.20 --n_points 5 --n_episodes 10
 
-# Test a specific friction value in detail
-python -m simulation.tune_friction --test_single 0.08
+# Test specific friction value
+python -m simulation.tune_friction --test_single 0.15
 
-# Train with virtual damping scenario (no friction)
-python -m simulation.train --timesteps 500000 --save_path models/ppo_virtual_damping
+# Train with stiction compensation (default config)
+python -m simulation.train --timesteps 500000 --save_path models/ppo_residual
 ```

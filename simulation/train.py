@@ -1,29 +1,27 @@
 """
-Training script for Residual RL Virtual Damping
+Training script for Residual RL Stiction Compensation
 
-This script trains a PPO agent to provide virtual damping for an underdamped
-reaction wheel pendulum. The key insight is that LQR with moderate gains
-creates an underdamped system with oscillatory transient response.
+This script trains a PPO agent to compensate for Stribeck friction (stiction)
+that degrades optimal LQR performance on a reaction wheel pendulum.
 
 RESEARCH CONTEXT:
-- Moderate LQR gains (scale=0.35) stabilize but result in underdamped response
-- The system oscillates significantly during transients
-- Physical friction helps (provides damping) but is unreliable
-- RL learns VIRTUAL DAMPING: u_RL(ω) ∝ -ω (velocity-proportional)
-- This is controllable, predictable, and doesn't depend on mechanical wear
+- Optimal LQR (scale=1.0) without friction: 0.78° RMS
+- With Stribeck friction (Ts=0.15 Nm): ~1.19° RMS (stiction dead zone)
+- RL with 4V authority overcomes stiction, recovering no-friction performance
 
 The hybrid control law is: u_total = u_LQR + α * u_RL
-where u_RL is the learned virtual damping and α is the residual_scale.
+where u_RL is the learned stiction compensation and α is the residual_scale.
 
 Why this is compelling:
-1. Genuine problem: Underdamped oscillations are a real control challenge
+1. Genuine problem: Stiction dead zones degrade optimal LQR
 2. LQR still essential: Handles stabilization (the hard part)
-3. RL role is clear: Learns damping (a simple, interpretable function)
-4. Practical benefit: More reliable than physical friction
+3. RL role is clear: Provides supplemental torque to overcome stiction
+4. Practical benefit: Restores performance without modifying LQR gains
 
 Expected Results:
-- LQR alone: 100% survival, ~2-4° RMS due to oscillations
-- Hybrid (LQR+RL): 100% survival, <1° RMS (RL provides damping)
+- No-friction LQR: 0.78° RMS (target performance)
+- Friction LQR alone: ~1.19° RMS (degraded by stiction)
+- Hybrid (LQR+RL): <0.9° RMS (compensates stiction)
 
 Usage:
     python -m simulation.train --timesteps 500000 --save_path models/ppo_residual
@@ -92,13 +90,13 @@ def make_env(
         seed: Random seed
         residual_scale: Scaling factor for residual action
         domain_randomization: Whether to use domain randomization
-        challenge_config: Challenge configuration (default: combined_challenges)
+        challenge_config: Challenge configuration (default: friction_compensation)
 
     Returns:
         Callable that creates the environment
     """
     if challenge_config is None:
-        challenge_config = ChallengeConfig.combined_challenges()
+        challenge_config = ChallengeConfig.friction_compensation()
 
     def _init():
         env = ReactionWheelEnv(
@@ -142,26 +140,26 @@ def train(
         checkpoint_freq: Frequency of checkpoint saves
         device: Device to use ('auto', 'cuda', 'mps', or 'cpu')
     """
-    # Get challenge config - underdamped LQR scenario
-    challenge_config = ChallengeConfig.underdamped_lqr()
+    # Get challenge config - stiction compensation scenario
+    challenge_config = ChallengeConfig.friction_compensation()
 
     print("=" * 60)
-    print("Training Residual RL for Virtual Damping")
+    print("Training Residual RL for Stiction Compensation")
     print("=" * 60)
     print(f"Total timesteps: {total_timesteps:,}")
     print(f"Parallel environments: {n_envs}")
-    print(f"Residual scale: {residual_scale}V (virtual damping authority)")
+    print(f"Residual scale: {residual_scale}V (stiction compensation authority)")
     print(f"Domain randomization: {domain_randomization}")
     print(f"Device: {device}")
     print()
-    print("LQR Configuration (underdamped):")
-    print(f"  - Gain scale: {challenge_config.lqr_gain_scale} (moderate → underdamped)")
-    print(f"  - Friction: None (training without physical friction)")
+    print("LQR Configuration (optimal, with Stribeck friction):")
+    print(f"  - Gain scale: {challenge_config.lqr_gain_scale} (optimal)")
+    print(f"  - Friction Ts: {challenge_config.friction.Ts} Nm (stiction)")
     print()
-    print("RESEARCH OBJECTIVE: Learn virtual damping u_RL(omega) ~ -k*omega")
-    print("  - LQR alone: 100% survival but oscillatory (~2-4 deg RMS)")
-    print("  - Target: Provide damping, achieve <1 deg RMS error")
-    print("  - The RL learns a function similar to friction, but controllable")
+    print("RESEARCH OBJECTIVE: Compensate stiction dead zone")
+    print("  - No-friction LQR: 0.78 deg RMS (target)")
+    print("  - Friction LQR alone: ~1.19 deg RMS (degraded)")
+    print("  - Target: Hybrid <0.9 deg RMS (overcome stiction)")
     print("=" * 60)
 
     # Create directories
@@ -282,7 +280,7 @@ def train(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train PPO agent to provide virtual damping for underdamped reaction wheel pendulum"
+        description="Train PPO agent to compensate for Stribeck friction on reaction wheel pendulum"
     )
     parser.add_argument(
         "--timesteps",
@@ -305,8 +303,8 @@ def main():
     parser.add_argument(
         "--residual_scale",
         type=float,
-        default=2.0,
-        help="Max voltage for virtual damping (default: 2.0V)",
+        default=4.0,
+        help="Max voltage for stiction compensation (default: 4.0V)",
     )
     parser.add_argument(
         "--no_domain_rand",

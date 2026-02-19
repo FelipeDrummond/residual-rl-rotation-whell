@@ -2,7 +2,11 @@
 Reaction Wheel Inverted Pendulum Gymnasium Environment
 
 This environment simulates a reaction wheel inverted pendulum with Stribeck friction,
-designed for training residual RL agents to compensate for non-linear friction effects.
+designed for training residual RL agents to compensate for stiction dead zones.
+
+Stribeck friction creates a dead zone where the motor cannot move the wheel at small
+pendulum angles (LQR commands too weak to overcome stiction). The RL agent learns
+supplemental torque to break through stiction and recover no-friction performance.
 
 The control architecture is hybrid:
     u_total = u_LQR + alpha * u_RL
@@ -87,7 +91,7 @@ class ReactionWheelEnv(gym.Env):
             if friction_params is not None:
                 self.friction_params = friction_params
             else:
-                self.friction_params = FrictionParams.moderate().to_dict()
+                self.friction_params = FrictionParams.research_friction().to_dict()
 
         # Store base friction for domain randomization
         self._base_friction_Ts = self.friction_params["Ts"]
@@ -117,16 +121,16 @@ class ReactionWheelEnv(gym.Env):
         self.lambda_damping = PHYSICAL_PARAMS.lambda_damping
         self.b1 = PHYSICAL_PARAMS.b1
         self.b2 = PHYSICAL_PARAMS.b2
-        self.Kv = 0.0  # Back-EMF constant (set to 0 as in MATLAB)
+        self.Kv = PHYSICAL_PARAMS.Kv  # Back-EMF constant from no-load motor specs
 
         # LQR gains - computed for INVERTED pendulum (theta=0 upright)
-        base_K = np.array([-50.0, 0.0, -6.45, -0.34])
+        base_K = np.array([-45.0, 0.0, -5.2, -0.62])
         self.K = self.lqr_gain_scale * base_K
 
-        # State limits for observation space
+        # State limits for observation space (5D: state + prev_action_normalized)
         self.observation_space = spaces.Box(
-            low=np.array([-np.pi, -np.inf, -ENV_CONFIG.max_theta_dot, -ENV_CONFIG.max_alpha_dot]),
-            high=np.array([np.pi, np.inf, ENV_CONFIG.max_theta_dot, ENV_CONFIG.max_alpha_dot]),
+            low=np.array([-np.pi, -np.inf, -ENV_CONFIG.max_theta_dot, -ENV_CONFIG.max_alpha_dot, -1.0]),
+            high=np.array([np.pi, np.inf, ENV_CONFIG.max_theta_dot, ENV_CONFIG.max_alpha_dot, 1.0]),
             dtype=np.float32,
         )
 
@@ -142,6 +146,7 @@ class ReactionWheelEnv(gym.Env):
         self.state = None
         self.steps = 0
         self.max_steps = ENV_CONFIG.max_steps
+        self.prev_action = 0.0  # Previous RL action (volts) for smoothness penalty
 
         # For rendering
         self.screen = None
@@ -269,27 +274,44 @@ class ReactionWheelEnv(gym.Env):
         l_44 = -((MrL2_Jh + self.Jr) * (self.b2 + self.Kt * self.Kv / self.Rm)) / (self.Jr * MrL2_Jh)
         l_4 = (12.0 * self.Kt * (MrL2_Jh + self.Jr)) / (self.Rm * self.Jr * MrL2_Jh)
 
-        # Calculate motor torque for stiction model
-        # Motor torque = Kt * I = Kt * (V/Rm) = Kt * (12*u_normalized) / Rm
-        motor_torque = self.Kt * (12.0 * u_normalized) / self.Rm
+        # Motor torque including back-EMF: I = (V - Kv*ω)/Rm, τ = Kt*I
+        # At high ω, back-EMF reduces current → less torque → natural speed limit
+        motor_torque = self.Kt * (12.0 * u_normalized - self.Kv * alpha_dot) / self.Rm
 
         # Friction torque on wheel (RESEARCH: added Stribeck friction with stiction)
         tau_friction = self._stribeck_friction(alpha_dot, motor_torque)
+
+        # Friction coupling coefficients (from inverse mass matrix derivation)
+        #
+        # The bearing friction between wheel and pendulum body creates:
+        #   - Torque on wheel: -tau_friction (opposes wheel motion)
+        #   - Reaction on pendulum: +tau_friction (Newton's third law at bearing)
+        #
+        # After decoupling through the inverse mass matrix M^(-1):
+        #   theta_ddot += +tau_friction / MrL2_Jh
+        #   alpha_ddot += -tau_friction * (MrL2_Jh + Jr) / (Jr * MrL2_Jh)
+        #
+        # Key physical consequence: when friction cancels motor torque (stiction),
+        # the net effect on BOTH pendulum and wheel is zero. The motor cannot
+        # control the pendulum if the wheel is stuck.
+        friction_coeff_theta = 1.0 / MrL2_Jh
+        friction_coeff_alpha = (MrL2_Jh + self.Jr) / (self.Jr * MrL2_Jh)
 
         # State derivatives (non-linear version using sin(theta) instead of linearized theta)
         theta_ddot = (
             l_31 * np.sin(theta) +  # Non-linear gravity term
             l_33 * theta_dot +
             l_34 * alpha_dot +
-            l_3 * u_normalized  # u_normalized ∈ [-1, 1], scaled by 12V in l_3
+            l_3 * u_normalized +  # Motor torque effect on pendulum
+            tau_friction * friction_coeff_theta  # Friction reaction on pendulum (from bearing)
         )
 
         alpha_ddot = (
             l_41 * np.sin(theta) +  # Non-linear gravity coupling
             l_43 * theta_dot +
             l_44 * alpha_dot +
-            l_4 * u_normalized -  # u_normalized ∈ [-1, 1], scaled by 12V in l_4
-            tau_friction / self.Jr  # Stribeck friction acts on wheel (RESEARCH addition)
+            l_4 * u_normalized -  # Motor torque effect on wheel
+            tau_friction * friction_coeff_alpha  # Friction on wheel (with correct coupling)
         )
 
         return np.array([theta_dot, alpha_dot, theta_ddot, alpha_ddot])
@@ -311,6 +333,11 @@ class ReactionWheelEnv(gym.Env):
             angle -= 2 * np.pi
         return angle
 
+    def _get_obs(self) -> np.ndarray:
+        """Build 5D observation: [theta, alpha, theta_dot, alpha_dot, prev_action_normalized]."""
+        prev_normalized = self.prev_action / self.residual_scale if self.residual_scale != 0 else 0.0
+        return np.append(self.state, prev_normalized).astype(np.float32)
+
     def reset(
         self,
         seed: Optional[int] = None,
@@ -326,20 +353,20 @@ class ReactionWheelEnv(gym.Env):
         super().reset(seed=seed)
 
         # Initial state: pendulum near upright, wheel at rest
-        # Larger initial perturbation to stress-test the controller with friction
-        theta_init = self.np_random.uniform(-0.3, 0.3)  # Up to ~17 degrees from upright
+        theta_init = self.np_random.uniform(*ENV_CONFIG.theta_init_range)
         alpha_init = 0.0
-        theta_dot_init = self.np_random.uniform(-0.5, 0.5)  # Initial angular velocity
+        theta_dot_init = self.np_random.uniform(*ENV_CONFIG.theta_dot_init_range)
         alpha_dot_init = 0.0
 
         self.state = np.array([theta_init, alpha_init, theta_dot_init, alpha_dot_init])
         self.steps = 0
+        self.prev_action = 0.0
 
         # Apply domain randomization if enabled
         if self.domain_randomization:
             self._randomize_parameters()
 
-        return self.state.astype(np.float32), {}
+        return self._get_obs(), {}
 
     def _randomize_parameters(self):
         """Apply domain randomization to physical parameters for robust sim-to-real transfer."""
@@ -394,11 +421,17 @@ class ReactionWheelEnv(gym.Env):
         # The dynamics equations expect normalized input (will be scaled by 12V internally)
         u_normalized = u_total / self.max_voltage
 
-        # Integrate dynamics using Euler method
-        state_dot = self._dynamics(self.state, u_normalized)
-
-        # Simple Euler integration (can be upgraded to RK4 if needed)
-        self.state = self.state + state_dot * self.dt
+        # Integrate dynamics using RK4 with sub-stepping for numerical stability.
+        # Stribeck friction creates stiff dynamics (large coupling coefficients),
+        # so we use multiple smaller steps within each control period.
+        n_substeps = 10
+        sub_dt = self.dt / n_substeps
+        for _ in range(n_substeps):
+            k1 = self._dynamics(self.state, u_normalized)
+            k2 = self._dynamics(self.state + 0.5 * sub_dt * k1, u_normalized)
+            k3 = self._dynamics(self.state + 0.5 * sub_dt * k2, u_normalized)
+            k4 = self._dynamics(self.state + sub_dt * k3, u_normalized)
+            self.state = self.state + (sub_dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
         # Add external disturbance (random push on pendulum)
         if self.disturbance_std > 0:
@@ -408,7 +441,8 @@ class ReactionWheelEnv(gym.Env):
         self.state[0] = self._normalize_angle(self.state[0])
 
         # Compute reward (penalize deviation from ideal behavior)
-        reward = self._compute_reward(self.state, u_RL)
+        reward = self._compute_reward(self.state, u_RL, self.prev_action)
+        self.prev_action = u_RL
 
         # Check termination conditions
         terminated = self._is_terminated(self.state)
@@ -425,17 +459,18 @@ class ReactionWheelEnv(gym.Env):
             "friction_torque": self._stribeck_friction(self.state[3], motor_torque),
         }
 
-        return self.state.astype(np.float32), reward, terminated, truncated, info
+        return self._get_obs(), reward, terminated, truncated, info
 
-    def _compute_reward(self, state: np.ndarray, u_RL: float) -> float:
+    def _compute_reward(self, state: np.ndarray, u_RL: float, prev_u_RL: float) -> float:
         """
-        Reward function balancing stabilization and control effort.
+        Reward function balancing stabilization, control effort, and smoothness.
 
         Uses weights from REWARD_CONFIG.
 
         Args:
             state: Current state [theta, alpha, theta_dot, alpha_dot]
-            u_RL: Residual RL control signal
+            u_RL: Current residual RL control signal (volts)
+            prev_u_RL: Previous step's RL control signal (volts)
 
         Returns:
             reward: Scalar reward
@@ -452,8 +487,11 @@ class ReactionWheelEnv(gym.Env):
         # Control effort penalty
         control_cost = REWARD_CONFIG.control_weight * u_RL**2
 
+        # Smoothness penalty: penalize rapid action changes (kills bang-bang chatter)
+        smoothness_cost = REWARD_CONFIG.smoothness_weight * (u_RL - prev_u_RL)**2
+
         # Total reward (negative cost)
-        reward = -(angle_cost + velocity_cost + control_cost)
+        reward = -(angle_cost + velocity_cost + control_cost + smoothness_cost)
 
         # Bonus for staying upright
         if abs(theta) < REWARD_CONFIG.upright_threshold:

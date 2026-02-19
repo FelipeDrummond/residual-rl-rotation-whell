@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **Residual Reinforcement Learning** project for virtual damping in a Reaction Wheel Inverted Pendulum. The system uses a hybrid control architecture where an LQR controller handles stabilization, and an RL agent (PPO) provides learned virtual damping to reduce oscillations.
+This is a **Residual Reinforcement Learning** project for stiction compensation in a Reaction Wheel Inverted Pendulum. The system uses a hybrid control architecture where an LQR controller handles stabilization, and an RL agent (PPO) provides learned supplemental torque to overcome Stribeck friction (stiction) dead zones.
 
 **Control Law:** `u_total(t) = u_LQR(t) + α · π_θ(s_t)`
 
-**Research Insight:** The underdamped LQR (moderate gains) stabilizes the pendulum but exhibits significant oscillations. Physical friction helps by providing natural damping, but is unreliable. The RL agent learns virtual damping (`u_RL ∝ -ω`) that is controllable and predictable.
+**Research Insight:** Stribeck friction creates a stiction dead zone where the motor torque from optimal LQR is insufficient to move the wheel at small pendulum angles. This degrades LQR performance from 0.24° to 0.90° RMS. The RL agent learns supplemental torque to overcome stiction, achieving 0.70° RMS (22.3% improvement).
 
-The workflow is **Sim-to-Real**: train a PPO agent in a Python digital twin (Gymnasium environment) to provide virtual damping, then deploy to ESP32 hardware.
+The workflow is **Sim-to-Real**: train a PPO agent in a Python digital twin (Gymnasium environment) to compensate for stiction, then deploy to ESP32 hardware.
 
 ## Repository Structure
 
@@ -144,9 +144,9 @@ python -m simulation.train --cpu          # Force CPU
 ```
 
 Key arguments:
-- `--timesteps`: Total training steps (default: 500,000)
+- `--timesteps`: Total training steps (default: 1,000,000)
 - `--n_envs`: Parallel environments (default: 4)
-- `--residual_scale`: Scaling factor α for residual (default: 1.0)
+- `--residual_scale`: Scaling factor α for residual (default: 4.0)
 - `--no_domain_rand`: Disable domain randomization
 - `--device`: Device selection (auto/cuda/mps/cpu)
 
@@ -175,33 +175,36 @@ Generates comparison plots and prints metrics (RMS error, reward, episode length
 
 **Control Architecture (in step function):**
 ```python
-u_LQR = -K · state  # Computed internally with K = [5.5413, 0.0, 0.7263, 0.0980]
+u_LQR = -K · state  # K = [45.0, 0.0, 5.2, 0.62] (computed via scipy ARE with back-EMF)
 u_total = u_LQR + residual_scale * action
 u_total = clip(u_total, -12V, +12V)
 ```
 
 **Physics Implementation:**
 - Non-linear equations of motion for coupled pendulum-wheel system
+- **Motor model with back-EMF**: `tau = Kt*(V - Kv*ω)/Rm`, Kv=0.285 V/(rad/s)
+  - Back-EMF damping `Kt*Kv/Rm = 0.00744` is 10.6× stronger than linear damping b2
 - Linear damping from MATLAB system ID:
   - `b1 = 0` (no pendulum damping)
   - `b2 = 2*λ*(Jh+Jr) ≈ 0.000703 N⋅m⋅s/rad` (wheel damping, λ=0.15060423)
-- **Damping Configuration** (RESEARCH):
-  - Default: **NO FRICTION** - creates underdamped system for RL training
-  - Optional Stribeck model available for comparison studies
-  - **Research finding:** Friction HELPS LQR by providing damping!
-  - **Research scenario (scale=0.35 LQR gains):**
-    - Without friction: 100% success, ~3° RMS (oscillatory)
-    - With friction: 100% success, ~1.3° RMS (damped)
-    - Optimal LQR (scale=1.0): ~0.9° RMS (target)
-  - **Research angle:** RL learns virtual damping (`u_RL ∝ -ω`) to match optimal LQR
-- Initial conditions: theta ∈ [-0.3, 0.3] rad, theta_dot ∈ [-0.5, 0.5] rad/s
-- Euler integration at dt=0.02s
+- **Friction Configuration** (RESEARCH):
+  - Default: **Stribeck friction** (Ts=0.08, Tc=0.048, vs=0.02, sigma=0.0)
+  - Creates stiction dead zone where motor torque < Ts → wheel stuck
+  - **Research scenario (scale=1.0 LQR gains):**
+    - No friction: 0.24° RMS (target performance)
+    - With friction (Ts=0.08): 0.90° RMS (degraded by stiction)
+    - Hybrid (LQR+RL, 4V): **0.70° RMS** (22.3% improvement)
+  - **Research angle:** RL learns supplemental torque to overcome stiction
+- Initial conditions: theta ∈ [-0.1, 0.1] rad, theta_dot ∈ [-0.2, 0.2] rad/s
+- RK4 integration with 10 sub-steps per control period at dt=0.02s
 
-**Reward Function (MRAC-based):**
+**Reward Function:**
 ```python
-reward = -(theta² + 0.1*theta_dot² + 0.001*alpha_dot² + 0.01*u_RL²)
+reward = -(theta² + 0.1*theta_dot² + 0.001*alpha_dot² + 0.005*u_RL² + 0.005*(u_RL - u_RL_prev)²)
 bonus = +1.0 if |theta| < 0.1 rad
 ```
+- `control_weight=0.005`: low because back-EMF naturally limits wheel speed
+- `smoothness_weight=0.005`: mild chatter penalty
 
 **Domain Randomization:** When enabled, randomizes masses, lengths, and friction parameters by ±10% for robust sim-to-real transfer.
 
@@ -216,23 +219,24 @@ bonus = +1.0 if |theta| < 0.1 rad
 
 ## Research Context
 
-This work is for a research paper: **"Hybrid Control for Reaction Wheel Pendulums: Virtual Damping via Residual Reinforcement Learning"**
+This work is for a research paper: **"Hybrid Control for Reaction Wheel Pendulums: Stiction Compensation via Residual Reinforcement Learning"**
 
 **The Core Problem:**
-LQR controllers with moderate gains create underdamped systems with oscillatory transient response. Physical friction can help provide damping, but it's unreliable (varies with temperature, wear, etc.) and not precisely controllable.
+Stribeck friction creates a stiction dead zone at low wheel velocities where the motor torque commanded by LQR is insufficient to move the wheel. At small pendulum angles, LQR commands small corrections that fall below the stiction threshold — the wheel remains stuck, the pendulum drifts, and performance degrades. Even optimal LQR (scale=1.0) is affected: RMS error increases from 0.78° to ~1.19°.
 
 **The Solution:**
-Train an RL agent to provide virtual damping: `u_RL(ω) ∝ -ω`. This is:
-1. Controllable and predictable (unlike physical friction)
-2. A simple, interpretable function (easy to verify and deploy)
-3. Complementary to LQR (LQR stabilizes, RL damps)
+Train an RL agent to provide supplemental torque that helps LQR overcome stiction. The RL adds extra torque when the LQR command alone would be absorbed by stiction. This is:
+1. Complementary to LQR (LQR stabilizes, RL overcomes stiction)
+2. Targeted (only activates when stiction is the bottleneck)
+3. Deployable to embedded systems (small network, 4V authority)
 
-**Expected Results:**
-- Underdamped LQR alone: 100% survival, ~3° RMS (oscillatory)
-- Hybrid (LQR + RL): 100% survival, <1° RMS (matches optimal LQR)
+**Results (model: ppo_bemf_v3):**
+- No-friction LQR: 0.24° RMS (target performance)
+- Friction LQR alone: 0.90° RMS (degraded by stiction)
+- Hybrid (LQR + RL): **0.70° RMS** (22.3% improvement, no constant bias)
 
 **Why This is Compelling:**
-1. Genuine problem (underdamped oscillations are common in control)
+1. Genuine problem (stiction dead zones degrade real control systems)
 2. LQR is essential (handles the hard stabilization task)
-3. RL role is clear (learns damping, not full control)
-4. Practical benefit (more reliable than mechanical friction)
+3. RL role is clear (overcomes stiction, not full control replacement)
+4. Practical benefit (stiction varies in real hardware; RL adapts)

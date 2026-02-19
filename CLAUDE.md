@@ -230,13 +230,15 @@ Train an RL agent to provide supplemental torque that helps LQR overcome stictio
 2. Targeted (only activates when stiction is the bottleneck)
 3. Deployable to embedded systems (small network, 4V authority)
 
-**Results (model: ppo_bemf_v3):**
-- No-friction LQR: 0.24° RMS (target performance)
+**Results (with angle-gated RL, 50 episodes):**
+- No-friction LQR: 0.22° RMS (target performance)
 - Friction LQR alone: 0.90° RMS (degraded by stiction)
-- Hybrid (LQR + RL): **0.70° RMS** (22.3% improvement, no constant bias)
+- Hybrid (LQR + RL): **0.48° RMS** (46.8% improvement, closes 62% of the gap)
+- Steady-state chatter: **eliminated** (gate → 0, |u_RL| → 0.002V in last 2s)
 
 **Why This is Compelling:**
 1. Genuine problem (stiction dead zones degrade real control systems)
 2. LQR is essential (handles the hard stabilization task)
-3. RL role is clear (overcomes stiction, not full control replacement)
+3. RL role is clear (overcomes stiction during transients, fades at equilibrium)
 4. Practical benefit (stiction varies in real hardware; RL adapts)
+5. Angle-gated RL ensures zero steady-state interference (stiction acts as free brake)

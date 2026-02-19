@@ -59,6 +59,7 @@ class ReactionWheelEnv(gym.Env):
         disturbance_std: float = None,
         challenge_config: Optional[ChallengeConfig] = None,
         render_mode: Optional[str] = None,
+        theta_gate_threshold: float = 0.05,
     ):
         """
         Initialize the environment.
@@ -103,6 +104,7 @@ class ReactionWheelEnv(gym.Env):
         self.domain_randomization = domain_randomization
         self.randomization_factor = randomization_factor
         self.render_mode = render_mode
+        self.theta_gate_threshold = theta_gate_threshold
 
         # Physical parameters (from config)
         self.g = PHYSICAL_PARAMS.g
@@ -408,6 +410,10 @@ class ReactionWheelEnv(gym.Env):
         # Extract residual action and scale it
         u_RL = float(action[0]) * self.residual_scale
 
+        # Angle-gated RL: fade residual to zero near upright to eliminate steady-state chatter
+        gate = min(1.0, abs(self.state[0]) / self.theta_gate_threshold)
+        u_RL = gate * u_RL
+
         # Compute LQR baseline control (returns voltage in range [-12V, +12V])
         u_LQR = self._lqr_control(self.state)
 
@@ -457,6 +463,7 @@ class ReactionWheelEnv(gym.Env):
             "u_RL": u_RL,
             "u_total": u_total,
             "friction_torque": self._stribeck_friction(self.state[3], motor_torque),
+            "gate": gate,
         }
 
         return self._get_obs(), reward, terminated, truncated, info

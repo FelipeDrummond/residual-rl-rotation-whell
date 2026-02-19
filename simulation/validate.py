@@ -40,6 +40,7 @@ def evaluate_lqr_only(
     n_episodes: int = 10,
     max_steps: int = 500,
     challenge_config: ChallengeConfig = None,
+    seeds: list = None,
 ) -> Dict[str, np.ndarray]:
     """
     Evaluate pure LQR controller (residual_scale = 0).
@@ -48,6 +49,7 @@ def evaluate_lqr_only(
         n_episodes: Number of evaluation episodes
         max_steps: Maximum steps per episode
         challenge_config: Challenge configuration
+        seeds: List of seeds for reproducible initial conditions
 
     Returns:
         Dictionary containing trajectories
@@ -65,13 +67,14 @@ def evaluate_lqr_only(
     all_rewards = []
     all_frictions = []
 
-    for _ in range(n_episodes):
+    for ep in range(n_episodes):
         states = []
         controls = []
         rewards = []
         frictions = []
 
-        obs, _ = env.reset()
+        seed = seeds[ep] if seeds is not None else None
+        obs, _ = env.reset(seed=seed)
         for _ in range(max_steps):
             # LQR only (residual action = 0)
             action = np.array([0.0])
@@ -103,6 +106,7 @@ def evaluate_hybrid(
     n_episodes: int = 10,
     max_steps: int = 500,
     challenge_config: ChallengeConfig = None,
+    seeds: list = None,
 ) -> Dict[str, np.ndarray]:
     """
     Evaluate hybrid control (LQR + Residual RL).
@@ -112,6 +116,7 @@ def evaluate_hybrid(
         n_episodes: Number of evaluation episodes
         max_steps: Maximum steps per episode
         challenge_config: Challenge configuration
+        seeds: List of seeds for reproducible initial conditions
 
     Returns:
         Dictionary containing trajectories
@@ -121,64 +126,65 @@ def evaluate_hybrid(
     # Load model
     model = PPO.load(model_path)
 
-    # Create environment with same parameters used during training
+    # Create raw environment (no VecNormalize wrapper — avoids double-reset seeding bug)
     env = ReactionWheelEnv(
         residual_scale=TRAINING_CONFIG.residual_scale,
         domain_randomization=False,
         challenge_config=challenge_config,
     )
 
-    # Try to load normalization stats if available
+    # Load normalization stats for manual normalization (same path as LQR for seeding)
     vec_normalize_path = os.path.join(os.path.dirname(model_path), "vec_normalize.pkl")
+    obs_mean = None
+    obs_var = None
+    clip_obs = 10.0
+    epsilon = 1e-8
     if os.path.exists(vec_normalize_path):
-        env = DummyVecEnv([lambda: env])
-        env = VecNormalize.load(vec_normalize_path, env)
-        env.training = False
-        env.norm_reward = False
-        use_vec = True
+        import pickle
+        with open(vec_normalize_path, 'rb') as f:
+            vec_norm = pickle.load(f)
+        obs_mean = vec_norm.obs_rms.mean
+        obs_var = vec_norm.obs_rms.var
+        clip_obs = vec_norm.clip_obs
+        print(f"Loaded normalization stats (mean={obs_mean}, var={obs_var})")
     else:
-        use_vec = False
         print("Warning: vec_normalize.pkl not found, using unnormalized observations")
+
+    def normalize_obs(obs):
+        if obs_mean is not None:
+            return np.clip((obs - obs_mean) / np.sqrt(obs_var + epsilon), -clip_obs, clip_obs).astype(np.float32)
+        return obs
 
     all_states = []
     all_controls = []
     all_residuals = []
     all_rewards = []
     all_frictions = []
+    all_gates = []
 
-    for _ in range(n_episodes):
+    for ep in range(n_episodes):
         states = []
         controls = []
         residuals = []
         rewards = []
         frictions = []
+        gates = []
 
-        if use_vec:
-            obs = env.reset()
-        else:
-            obs, _ = env.reset()
+        seed = seeds[ep] if seeds is not None else None
+        obs, _ = env.reset(seed=seed)
+        obs_normalized = normalize_obs(obs)
 
         for _ in range(max_steps):
-            action, _ = model.predict(obs, deterministic=True)
+            action, _ = model.predict(obs_normalized, deterministic=True)
+            obs, reward, terminated, truncated, info = env.step(action)
+            obs_normalized = normalize_obs(obs)
 
-            if use_vec:
-                obs, reward, done, info = env.step(action)
-                info = info[0]
-                terminated = done[0]
-                truncated = False
-            else:
-                obs, reward, terminated, truncated, info = env.step(action)
-
-            if use_vec:
-                current_obs = env.get_original_obs()[0]
-            else:
-                current_obs = obs
-
-            states.append(current_obs.copy())
+            states.append(obs.copy())
             controls.append(info["u_total"])
             residuals.append(info["u_RL"])
-            rewards.append(reward if not use_vec else reward[0])
+            rewards.append(reward)
             frictions.append(info["friction_torque"])
+            gates.append(info["gate"])
 
             if terminated or truncated:
                 break
@@ -188,6 +194,7 @@ def evaluate_hybrid(
         all_residuals.append(np.array(residuals))
         all_rewards.append(np.array(rewards))
         all_frictions.append(np.array(frictions))
+        all_gates.append(np.array(gates))
 
     return {
         "states": all_states,
@@ -195,6 +202,7 @@ def evaluate_hybrid(
         "residuals": all_residuals,
         "rewards": all_rewards,
         "frictions": all_frictions,
+        "gates": all_gates,
     }
 
 
@@ -402,6 +410,8 @@ def plot_phase_portrait(
 
 def print_metrics(lqr_results: Dict, hybrid_results: Dict):
     """Print performance metrics demonstrating stiction compensation."""
+    dt = 0.02
+
     print("\n" + "=" * 60)
     print("STICTION COMPENSATION RESULTS")
     print("=" * 60)
@@ -410,10 +420,53 @@ def print_metrics(lqr_results: Dict, hybrid_results: Dict):
     lqr_rms = [np.sqrt(np.mean(states[:, 0]**2)) for states in lqr_results["states"]]
     hybrid_rms = [np.sqrt(np.mean(states[:, 0]**2)) for states in hybrid_results["states"]]
 
-    print("\nRMS Angle Error:")
+    print("\nRMS Angle Error (full episode):")
     print(f"  Friction LQR:    {np.mean(lqr_rms):.4f} ± {np.std(lqr_rms):.4f} rad ({np.degrees(np.mean(lqr_rms)):.2f}°)")
     print(f"  Hybrid (LQR+RL): {np.mean(hybrid_rms):.4f} ± {np.std(hybrid_rms):.4f} rad ({np.degrees(np.mean(hybrid_rms)):.2f}°)")
     print(f"  Improvement: {(1 - np.mean(hybrid_rms)/np.mean(lqr_rms))*100:.1f}%")
+
+    # Transient vs steady-state breakdown
+    transient_steps = int(2.0 / dt)  # first 2s
+    steady_steps = int(2.0 / dt)     # last 2s
+
+    def phase_metrics(results, label):
+        trans_abs = []
+        steady_abs = []
+        for states in results["states"]:
+            if len(states) > transient_steps:
+                trans_abs.append(np.mean(np.abs(states[:transient_steps, 0])))
+            if len(states) > steady_steps:
+                steady_abs.append(np.mean(np.abs(states[-steady_steps:, 0])))
+        print(f"  {label}:")
+        if trans_abs:
+            print(f"    First 2s mean |θ|: {np.degrees(np.mean(trans_abs)):.3f}°")
+        if steady_abs:
+            print(f"    Last 2s  mean |θ|: {np.degrees(np.mean(steady_abs)):.3f}°")
+
+    print("\nTransient vs Steady-State Breakdown:")
+    phase_metrics(lqr_results, "Friction LQR")
+    phase_metrics(hybrid_results, "Hybrid (LQR+RL)")
+
+    # RL residual stats in last 2s
+    if "residuals" in hybrid_results:
+        steady_u_rl = []
+        steady_u_rl_std = []
+        for residuals in hybrid_results["residuals"]:
+            if len(residuals) > steady_steps:
+                tail = residuals[-steady_steps:]
+                steady_u_rl.append(np.mean(np.abs(tail)))
+                steady_u_rl_std.append(np.std(tail))
+        if steady_u_rl:
+            print(f"\n  Hybrid last 2s |u_RL|: {np.mean(steady_u_rl):.3f}V (std: {np.mean(steady_u_rl_std):.3f}V)")
+
+    # Gate stats
+    if "gates" in hybrid_results:
+        steady_gates = []
+        for gates in hybrid_results["gates"]:
+            if len(gates) > steady_steps:
+                steady_gates.append(np.mean(gates[-steady_steps:]))
+        if steady_gates:
+            print(f"  Hybrid last 2s mean gate: {np.mean(steady_gates):.4f}")
 
     # Total reward
     lqr_reward = [np.sum(rewards) for rewards in lqr_results["rewards"]]
@@ -487,12 +540,17 @@ def main():
     print(f"  - LQR gain scale: {baseline_config.lqr_gain_scale} (optimal, no friction)")
     print("\nGoal: RL compensates stiction to recover no-friction performance.")
 
+    # Generate shared seeds so all controllers start from identical initial conditions
+    rng = np.random.default_rng(42)
+    seeds = [int(rng.integers(0, 2**31)) for _ in range(args.episodes)]
+
     # 1. Evaluate no-friction LQR (target - this is what we want to achieve)
     print("\n[1/4] Evaluating no-friction LQR (scale=1.0, target performance)...")
     lqr_no_friction_results = evaluate_lqr_only(
         n_episodes=args.episodes,
         max_steps=args.max_steps,
         challenge_config=baseline_config,
+        seeds=seeds,
     )
 
     # 2. Evaluate friction LQR (should show degraded performance)
@@ -501,6 +559,7 @@ def main():
         n_episodes=args.episodes,
         max_steps=args.max_steps,
         challenge_config=challenge_config,
+        seeds=seeds,
     )
 
     # 3. Evaluate Hybrid control (should compensate stiction)
@@ -511,6 +570,7 @@ def main():
             n_episodes=args.episodes,
             max_steps=args.max_steps,
             challenge_config=challenge_config,
+            seeds=seeds,
         )
 
         # Print metrics

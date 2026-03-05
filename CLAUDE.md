@@ -8,7 +8,7 @@ This is a **Residual Reinforcement Learning** project for stiction compensation 
 
 **Control Law:** `u_total(t) = u_LQR(t) + α · π_θ(s_t)`
 
-**Research Insight:** Stribeck friction creates a stiction dead zone where the motor torque from optimal LQR is insufficient to move the wheel at small pendulum angles. This degrades LQR performance from 0.24° to 0.90° RMS. The RL agent learns supplemental torque to overcome stiction, achieving 0.70° RMS (22.3% improvement).
+**Research Insight:** Stribeck friction creates a stiction dead zone where the motor torque from optimal LQR is insufficient to move the wheel at small pendulum angles. This degrades LQR performance from 0.22° to 0.90° RMS. The angle-gated RL agent learns supplemental torque to overcome stiction, achieving 0.48° RMS (46.8% improvement).
 
 The workflow is **Sim-to-Real**: train a PPO agent in a Python digital twin (Gymnasium environment) to compensate for stiction, then deploy to ESP32 hardware.
 
@@ -110,11 +110,18 @@ The digital twin is implemented in `simulation/` with the following structure:
 ```
 simulation/
 ├── __init__.py
+├── config.py                     # Centralized configuration (physics, rewards, training)
 ├── envs/
 │   ├── __init__.py
 │   └── reaction_wheel_env.py    # ReactionWheelEnv (Gymnasium)
 ├── train.py                      # PPO training script
 ├── validate.py                   # LQR vs Hybrid comparison
+├── plotting_callback.py          # Training learning curve plots
+├── plot_results.py               # Result visualization utilities
+├── test_env.py                   # Environment smoke tests
+├── test_lqr_only.py              # LQR-only baseline testing
+├── tune_friction.py              # Friction parameter tuning
+├── check_device.py               # GPU/MPS device detection
 └── README.md
 ```
 
@@ -144,7 +151,7 @@ python -m simulation.train --cpu          # Force CPU
 ```
 
 Key arguments:
-- `--timesteps`: Total training steps (default: 1,000,000)
+- `--timesteps`: Total training steps (default: 500,000; TrainingConfig default: 1,000,000)
 - `--n_envs`: Parallel environments (default: 4)
 - `--residual_scale`: Scaling factor α for residual (default: 4.0)
 - `--no_domain_rand`: Disable domain randomization
@@ -166,9 +173,10 @@ Generates comparison plots and prints metrics (RMS error, reward, episode length
 
 ### Environment Details (`ReactionWheelEnv`)
 
-**Observation Space:** `[theta, alpha, theta_dot, alpha_dot]`
+**Observation Space (5D):** `[theta, alpha, theta_dot, alpha_dot, prev_action_normalized]`
 - Uses same physical parameters from MATLAB system ID
 - State limits: theta ∈ [-π, π], velocities capped for numerical stability
+- `prev_action_normalized`: previous RL action divided by `residual_scale` (in [-1, 1])
 
 **Action Space:** Residual control signal (scalar, normalized to [-1, 1])
 - Scaled by `residual_scale` parameter before adding to LQR
@@ -176,7 +184,9 @@ Generates comparison plots and prints metrics (RMS error, reward, episode length
 **Control Architecture (in step function):**
 ```python
 u_LQR = -K · state  # K = [45.0, 0.0, 5.2, 0.62] (computed via scipy ARE with back-EMF)
-u_total = u_LQR + residual_scale * action
+u_RL = residual_scale * action
+gate = min(1.0, |theta| / 0.05)  # Angle gate: fades RL to zero near upright
+u_total = u_LQR + gate * u_RL
 u_total = clip(u_total, -12V, +12V)
 ```
 
@@ -188,13 +198,14 @@ u_total = clip(u_total, -12V, +12V)
   - `b1 = 0` (no pendulum damping)
   - `b2 = 2*λ*(Jh+Jr) ≈ 0.000703 N⋅m⋅s/rad` (wheel damping, λ=0.15060423)
 - **Friction Configuration** (RESEARCH):
-  - Default: **Stribeck friction** (Ts=0.08, Tc=0.048, vs=0.02, sigma=0.0)
+  - Default: **Stribeck friction via `research_friction()`** (Ts=0.15, Tc=0.09, vs=0.02, sigma=0.0)
   - Creates stiction dead zone where motor torque < Ts → wheel stuck
-  - **Research scenario (scale=1.0 LQR gains):**
-    - No friction: 0.24° RMS (target performance)
-    - With friction (Ts=0.08): 0.90° RMS (degraded by stiction)
-    - Hybrid (LQR+RL, 4V): **0.70° RMS** (22.3% improvement)
+  - **Research scenario (scale=1.0 LQR gains, angle-gated RL):**
+    - No friction: 0.22° RMS (target performance)
+    - With friction (Ts=0.15): 0.90° RMS (degraded by stiction)
+    - Hybrid (LQR+RL, 4V): **0.48° RMS** (46.8% improvement)
   - **Research angle:** RL learns supplemental torque to overcome stiction
+- **Angle Gate:** `gate = min(1.0, |θ| / 0.05)` fades RL to zero near upright, eliminating steady-state chatter
 - Initial conditions: theta ∈ [-0.1, 0.1] rad, theta_dot ∈ [-0.2, 0.2] rad/s
 - RK4 integration with 10 sub-steps per control period at dt=0.02s
 
@@ -205,6 +216,11 @@ bonus = +1.0 if |theta| < 0.1 rad
 ```
 - `control_weight=0.005`: low because back-EMF naturally limits wheel speed
 - `smoothness_weight=0.005`: mild chatter penalty
+- Weights loaded from `REWARD_CONFIG` in `simulation/config.py`
+
+**PPO Hyperparameters (from `TrainingConfig`):**
+- `ent_coef=0.005`: low entropy — back-EMF eliminated constant-bias exploit, let policy converge
+- Network: policy [32, 32], value [64, 64] with Tanh activation (for ESP32 fixed-point conversion)
 
 **Domain Randomization:** When enabled, randomizes masses, lengths, and friction parameters by ±10% for robust sim-to-real transfer.
 
@@ -222,7 +238,7 @@ bonus = +1.0 if |theta| < 0.1 rad
 This work is for a research paper: **"Hybrid Control for Reaction Wheel Pendulums: Stiction Compensation via Residual Reinforcement Learning"**
 
 **The Core Problem:**
-Stribeck friction creates a stiction dead zone at low wheel velocities where the motor torque commanded by LQR is insufficient to move the wheel. At small pendulum angles, LQR commands small corrections that fall below the stiction threshold — the wheel remains stuck, the pendulum drifts, and performance degrades. Even optimal LQR (scale=1.0) is affected: RMS error increases from 0.78° to ~1.19°.
+Stribeck friction creates a stiction dead zone at low wheel velocities where the motor torque commanded by LQR is insufficient to move the wheel. At small pendulum angles, LQR commands small corrections that fall below the stiction threshold — the wheel remains stuck, the pendulum drifts, and performance degrades. Even optimal LQR (scale=1.0) is affected: RMS error increases from 0.22° to 0.90°.
 
 **The Solution:**
 Train an RL agent to provide supplemental torque that helps LQR overcome stiction. The RL adds extra torque when the LQR command alone would be absorbed by stiction. This is:

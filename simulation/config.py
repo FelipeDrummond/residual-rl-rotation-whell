@@ -77,87 +77,45 @@ class PhysicalParams:
 
 
 # =============================================================================
-# Friction Parameters
+# Cogging Torque Parameters
 # =============================================================================
 
 @dataclass
-class FrictionParams:
+class CoggingParams:
     """
-    Stribeck friction model parameters.
+    Cogging torque model parameters.
 
-    The Stribeck friction model captures the nonlinear relationship between
-    friction and velocity, particularly the "stiction" effect at low velocities:
+    Cogging torque is a position-dependent disturbance from motor magnets
+    interacting with stator teeth:
 
-        F(ω) = (Tc + (Ts-Tc)·exp(-|ω|/vs))·sign(ω) + σ·ω
+        τ_cog(α) = amplitude · sin(n_poles · α + phase_offset)
 
-    Key insight for limit cycles:
-    - At low velocities (|ω| < vs), friction is HIGH (near Ts)
-    - LQR commands small corrections near equilibrium
-    - If LQR command < Ts, wheel doesn't move → pendulum drifts
-    - Pendulum drifts → LQR increases command → exceeds Ts → wheel breaks loose
-    - Sudden release causes overshoot → LQR reverses → hits stiction again
-    - Result: persistent limit cycle oscillations
-
-    For RL to be useful:
-    - Ts must be significant relative to LQR commands near equilibrium
-    - vs must be small (sharp stiction-to-slip transition)
-    - sigma (viscous) should be low (viscous damping helps LQR, we want to challenge it)
+    Key insight for RL:
+    - Cogging is a function of wheel POSITION (α), not velocity
+    - LQR with K[1]=0 (no wheel angle feedback) structurally cannot compensate it
+    - The RL agent must learn position-dependent compensation
+    - This creates a clear, principled role for RL that LQR cannot fill
     """
 
-    Ts: float = 0.08  # Static friction (stiction) - N·m
-    Tc: float = 0.048  # Coulomb friction (kinetic) - N·m (0.6 * Ts)
-    vs: float = 0.02   # Stribeck velocity - rad/s (SMALL for sharp transition)
-    sigma: float = 0.0  # Viscous friction coefficient (0 = no viscous help for LQR)
-
-    def to_dict(self) -> Dict[str, float]:
-        """Convert to dictionary for environment."""
-        return {
-            "Ts": self.Ts,
-            "Tc": self.Tc,
-            "vs": self.vs,
-            "sigma": self.sigma,
-        }
+    amplitude: float = 0.05  # Nm - cogging torque amplitude
+    n_poles: int = 7         # Number of magnetic pole pairs
+    phase_offset: float = 0.0  # rad - phase offset
 
     @classmethod
-    def no_friction(cls) -> "FrictionParams":
-        """Create zero-friction configuration."""
-        return cls(Ts=0.0, Tc=0.0, vs=0.02, sigma=0.0)
+    def no_cogging(cls) -> "CoggingParams":
+        """Create zero-cogging configuration."""
+        return cls(amplitude=0.0, n_poles=7, phase_offset=0.0)
 
     @classmethod
-    def research_friction(cls) -> "FrictionParams":
+    def research_cogging(cls) -> "CoggingParams":
         """
-        Research friction: Stribeck parameters that degrade optimal LQR.
+        Research cogging: parameters that degrade optimal LQR.
 
-        With corrected physics (friction coupling on both pendulum and wheel
-        via inverse mass matrix), these parameters create a stiction dead zone
-        where the motor torque is insufficient to move the wheel at small angles.
-
-        At Ts=0.15 Nm, optimal LQR (scale=1.0) degrades from 0.78° to ~1.19° RMS.
-        The RL agent with 4V authority can reduce the dead zone and recover performance.
+        At amplitude=0.05 Nm, comparable to LQR torque commands near
+        equilibrium. LQR with K[1]=0 cannot compensate position-dependent
+        disturbance, so performance degrades significantly.
         """
-        return cls(Ts=0.15, Tc=0.09, vs=0.02, sigma=0.0)
-
-    @classmethod
-    def limit_cycle(cls) -> "FrictionParams":
-        """
-        Friction parameters tuned to cause limit cycles with optimal LQR.
-
-        The key is:
-        - Ts high enough that small LQR commands can't overcome stiction
-        - vs small so the transition is sharp (creates stick-slip)
-        - sigma=0 so there's no viscous damping to help LQR
-        """
-        return cls(Ts=0.08, Tc=0.048, vs=0.02, sigma=0.0)
-
-    @classmethod
-    def mild_friction(cls) -> "FrictionParams":
-        """Mild friction - LQR handles this well, for baseline comparison."""
-        return cls(Ts=0.03, Tc=0.018, vs=0.02, sigma=0.0)
-
-    @classmethod
-    def severe_friction(cls) -> "FrictionParams":
-        """Severe friction - LQR struggles significantly."""
-        return cls(Ts=0.12, Tc=0.072, vs=0.02, sigma=0.0)
+        return cls(amplitude=0.05, n_poles=7, phase_offset=0.0)
 
 
 # =============================================================================
@@ -192,85 +150,52 @@ class ChallengeConfig:
     """
     Configuration for research challenge scenarios.
 
-    RESEARCH INSIGHT (from corrected physics model):
-    Stribeck friction creates a stiction dead zone where the motor torque
-    is insufficient to move the wheel at small pendulum angles. This degrades
-    even optimal LQR (scale=1.0) from 0.78° to ~1.19° RMS.
+    RESEARCH INSIGHT:
+    Cogging torque is position-dependent: τ_cog = A·sin(N·α). Since LQR
+    uses K[1]=0 (no wheel angle feedback), it structurally cannot compensate
+    this disturbance. The RL agent learns α-dependent compensation that
+    LQR cannot provide.
 
     The research angle is:
-    1. Optimal LQR without friction: 0.78° RMS (target performance)
-    2. Optimal LQR with Stribeck friction (Ts=0.15): ~1.19° RMS (the problem)
-    3. Hybrid (LQR + RL with 4V authority): <0.9° RMS (the solution)
-
-    The RL agent learns supplemental torque to overcome stiction at small angles,
-    recovering the no-friction performance level.
+    1. Optimal LQR without cogging: ~0.22° RMS (target performance)
+    2. Optimal LQR with cogging: degraded RMS (the problem)
+    3. Hybrid (LQR + RL): recovers toward baseline (the solution)
     """
 
     # LQR configuration
     lqr_gain_scale: float = 1.0
 
-    # Sensor noise - keep minimal for clean experiments
-    observation_noise_std: float = 0.0
-
-    # External disturbances - keep zero (not the research focus)
-    disturbance_std: float = 0.0
-
-    # Friction - Stribeck friction is the research challenge
-    friction: FrictionParams = field(default_factory=FrictionParams.research_friction)
+    # Cogging torque - the research challenge
+    cogging: CoggingParams = field(default_factory=CoggingParams.research_cogging)
 
     @classmethod
     def optimal_lqr_baseline(cls) -> "ChallengeConfig":
         """
-        No-friction LQR baseline (scale=1.0).
+        No-cogging LQR baseline (scale=1.0).
 
-        This is the target performance: what optimal LQR achieves without friction.
-        Expected: ~0.78° RMS.
+        This is the target performance: what optimal LQR achieves without cogging.
         """
         return cls(
             lqr_gain_scale=1.0,
-            observation_noise_std=0.0,
-            disturbance_std=0.0,
-            friction=FrictionParams.no_friction(),
+            cogging=CoggingParams.no_cogging(),
         )
 
     @classmethod
-    def friction_compensation(cls) -> "ChallengeConfig":
+    def cogging_compensation(cls) -> "ChallengeConfig":
         """
-        PRIMARY RESEARCH SCENARIO: Stiction compensation via residual RL.
+        PRIMARY RESEARCH SCENARIO: Cogging compensation via residual RL.
 
         Configuration:
         - Optimal LQR gains (scale=1.0)
-        - Stribeck friction (Ts=0.15 Nm) creating stiction dead zone
-        - No noise/disturbances (clean experiment)
+        - Cogging torque (A=0.05 Nm, 7 poles)
+        - LQR with K[1]=0 cannot compensate position-dependent cogging
 
-        Expected performance:
-        - No-friction LQR: 0.78° RMS (target)
-        - Friction LQR alone: ~1.19° RMS (degraded by stiction)
-        - Hybrid (LQR+RL, 4V authority): <0.9° RMS (compensates stiction)
-
-        The RL agent learns supplemental torque to overcome stiction,
-        recovering the no-friction performance level.
+        The RL agent learns wheel-position-dependent compensation
+        that LQR structurally cannot provide.
         """
         return cls(
             lqr_gain_scale=1.0,
-            observation_noise_std=0.0,
-            disturbance_std=0.0,
-            friction=FrictionParams.research_friction(),
-        )
-
-    @classmethod
-    def underdamped_lqr(cls) -> "ChallengeConfig":
-        """
-        Legacy scenario: Underdamped LQR (scale=0.35, no friction).
-
-        Kept for comparison. The friction_compensation() scenario
-        is now the primary research focus.
-        """
-        return cls(
-            lqr_gain_scale=0.35,
-            observation_noise_std=0.0,
-            disturbance_std=0.0,
-            friction=FrictionParams.no_friction(),
+            cogging=CoggingParams.research_cogging(),
         )
 
 
@@ -281,17 +206,13 @@ class ChallengeConfig:
 @dataclass
 class TrainingConfig:
     """
-    PPO training configuration for stiction compensation.
+    PPO training configuration for cogging torque compensation.
 
-    KEY INSIGHT: The RL agent learns supplemental torque to overcome
-    stiction dead zones that degrade optimal LQR performance.
+    KEY INSIGHT: The RL agent learns position-dependent compensation
+    for cogging torque that LQR (with K[1]=0) structurally cannot provide.
 
     The residual_scale determines the maximum RL authority.
-    At 4V, the RL can overcome stiction at θ>2° vs LQR alone at θ>6.6°,
-    significantly reducing the dead zone where stiction locks the wheel.
-
-    Timesteps raised to 1M after reward retuning (control_weight + smoothness
-    penalty) — the tighter reward landscape needs more exploration.
+    At 2V, the RL has enough authority to counteract 0.05 Nm cogging.
     """
 
     # Training parameters
@@ -299,12 +220,12 @@ class TrainingConfig:
     n_envs: int = 4
     learning_rate: float = 3e-4
 
-    # Residual RL - sized to overcome stiction dead zone
+    # Residual RL - sized to counteract cogging torque
     # Action [-1, 1] maps to [-residual_scale, +residual_scale] volts
-    # 4V provides enough authority to break through Ts=0.15 Nm stiction
-    residual_scale: float = 4.0
+    # 2V provides enough authority to compensate 0.05 Nm cogging
+    residual_scale: float = 2.0
 
-    # Domain randomization - disabled for clean stiction signal first
+    # Domain randomization - disabled for clean cogging signal first
     domain_randomization: bool = False
     randomization_factor: float = 0.10  # ±10% variation (when enabled)
 
@@ -315,12 +236,11 @@ class TrainingConfig:
     gamma: float = 0.995  # High for long-horizon stability
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.005  # Low: back-EMF eliminated constant-bias exploit, let policy converge
+    ent_coef: float = 0.005  # Low: let policy converge to position-dependent pattern
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
     # Network architecture (small for ESP32 deployment)
-    # Virtual damping is a simple function - small network is enough
     policy_layers: tuple = (32, 32)
     value_layers: tuple = (64, 64)
 
@@ -344,8 +264,8 @@ class EnvConfig:
     theta_limit: float = 1.047  # ~60 degrees (pi/3)
     theta_dot_limit: float = 15.0  # rad/s
 
-    # Initial state ranges (small: focus on stiction regime near equilibrium)
-    theta_init_range: tuple = (-0.1, 0.1)  # ~±6 degrees (where stiction matters)
+    # Initial state ranges
+    theta_init_range: tuple = (-0.1, 0.1)  # ~±6 degrees
     theta_dot_init_range: tuple = (-0.2, 0.2)  # rad/s
 
 
@@ -358,19 +278,15 @@ class RewardConfig:
     """
     Reward function weights.
 
-    Tuning rationale (after Phase 5 bang-bang failure):
-    - control_weight=0.05: max cost per step = 0.05*16 = 0.8, comparable to upright_bonus=1.0
-    - smoothness_weight=0.02: max chatter cost (±4V swing) = 0.02*64 = 1.28 per step
-    - This creates real trade-offs: using high voltage must yield proportional angle improvement,
-      and rapid oscillation between ±max is very expensive.
+    Simplified for cogging compensation (no smoothness term needed —
+    cogging compensation is inherently smooth since it's position-dependent).
     """
 
     # Cost weights
     angle_weight: float = 1.0  # Weight for theta^2
     velocity_weight: float = 0.1  # Weight for theta_dot^2
-    wheel_velocity_weight: float = 0.001  # Weight for alpha_dot^2 (back-EMF naturally limits wheel speed)
-    control_weight: float = 0.005  # Weight for u_RL^2 (low: back-EMF limits wheel, let RL act)
-    smoothness_weight: float = 0.005  # Weight for (u_RL_t - u_RL_{t-1})^2 (mild chatter penalty)
+    wheel_velocity_weight: float = 0.001  # Weight for alpha_dot^2
+    control_weight: float = 0.005  # Weight for u_RL^2
 
     # Bonus
     upright_bonus: float = 1.0  # Bonus for |theta| < upright_threshold
@@ -393,5 +309,5 @@ REWARD_CONFIG = RewardConfig()
 # Default training config
 TRAINING_CONFIG = TrainingConfig()
 
-# Default challenge scenario: stiction compensation with optimal LQR
-CHALLENGE_CONFIG = ChallengeConfig.friction_compensation()
+# Default challenge scenario: cogging compensation with optimal LQR
+CHALLENGE_CONFIG = ChallengeConfig.cogging_compensation()

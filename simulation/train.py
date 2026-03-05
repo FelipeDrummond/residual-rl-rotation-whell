@@ -1,27 +1,22 @@
 """
-Training script for Residual RL Stiction Compensation
+Training script for Residual RL Cogging Torque Compensation
 
-This script trains a PPO agent to compensate for Stribeck friction (stiction)
-that degrades optimal LQR performance on a reaction wheel pendulum.
+This script trains a PPO agent to compensate for cogging torque that
+degrades optimal LQR performance on a reaction wheel pendulum.
 
 RESEARCH CONTEXT:
-- Optimal LQR (scale=1.0) without friction: 0.78° RMS
-- With Stribeck friction (Ts=0.15 Nm): ~1.19° RMS (stiction dead zone)
-- RL with 4V authority overcomes stiction, recovering no-friction performance
+- Cogging torque is position-dependent: τ_cog = A·sin(N·α)
+- LQR with K[1]=0 (no wheel angle feedback) structurally cannot compensate it
+- RL learns α-dependent supplemental torque to recover no-cogging performance
 
 The hybrid control law is: u_total = u_LQR + α * u_RL
-where u_RL is the learned stiction compensation and α is the residual_scale.
+where u_RL is the learned cogging compensation.
 
 Why this is compelling:
-1. Genuine problem: Stiction dead zones degrade optimal LQR
+1. Structural limitation: LQR with K[1]=0 ignores wheel position entirely
 2. LQR still essential: Handles stabilization (the hard part)
-3. RL role is clear: Provides supplemental torque to overcome stiction
-4. Practical benefit: Restores performance without modifying LQR gains
-
-Expected Results:
-- No-friction LQR: 0.78° RMS (target performance)
-- Friction LQR alone: ~1.19° RMS (degraded by stiction)
-- Hybrid (LQR+RL): <0.9° RMS (compensates stiction)
+3. RL role is principled: Provides position-dependent compensation LQR cannot
+4. Practical benefit: Cogging varies across motors; RL adapts
 
 Usage:
     python -m simulation.train --timesteps 500000 --save_path models/ppo_residual
@@ -51,12 +46,6 @@ def get_device(force_cpu: bool = False) -> str:
     Automatically detect and return the best available device.
 
     Priority: CUDA > MPS > CPU
-
-    Args:
-        force_cpu: If True, use CPU regardless of GPU availability
-
-    Returns:
-        Device string: 'cuda', 'mps', or 'cpu'
     """
     if force_cpu:
         print("Forcing CPU usage (--cpu flag)")
@@ -82,21 +71,9 @@ def make_env(
     domain_randomization: bool = TRAINING_CONFIG.domain_randomization,
     challenge_config: ChallengeConfig = None,
 ):
-    """
-    Create a single environment instance.
-
-    Args:
-        rank: Index of the environment
-        seed: Random seed
-        residual_scale: Scaling factor for residual action
-        domain_randomization: Whether to use domain randomization
-        challenge_config: Challenge configuration (default: friction_compensation)
-
-    Returns:
-        Callable that creates the environment
-    """
+    """Create a single environment instance."""
     if challenge_config is None:
-        challenge_config = ChallengeConfig.friction_compensation()
+        challenge_config = ChallengeConfig.cogging_compensation()
 
     def _init():
         env = ReactionWheelEnv(
@@ -123,43 +100,30 @@ def train(
     device: str = "auto",
 ):
     """
-    Train PPO agent to improve LQR performance under challenging conditions.
+    Train PPO agent to compensate for cogging torque.
 
     The RL agent learns a residual control policy. The hybrid control is:
         u_total = u_LQR + residual_scale * u_RL
-
-    Args:
-        total_timesteps: Total training timesteps
-        n_envs: Number of parallel environments
-        learning_rate: Learning rate for PPO
-        residual_scale: Scaling factor for residual action (higher = more RL authority)
-        domain_randomization: Whether to use domain randomization
-        save_path: Path to save trained model
-        tensorboard_log: Path for tensorboard logs
-        eval_freq: Frequency of evaluation episodes
-        checkpoint_freq: Frequency of checkpoint saves
-        device: Device to use ('auto', 'cuda', 'mps', or 'cpu')
     """
-    # Get challenge config - stiction compensation scenario
-    challenge_config = ChallengeConfig.friction_compensation()
+    challenge_config = ChallengeConfig.cogging_compensation()
 
     print("=" * 60)
-    print("Training Residual RL for Stiction Compensation")
+    print("Training Residual RL for Cogging Torque Compensation")
     print("=" * 60)
     print(f"Total timesteps: {total_timesteps:,}")
     print(f"Parallel environments: {n_envs}")
-    print(f"Residual scale: {residual_scale}V (stiction compensation authority)")
+    print(f"Residual scale: {residual_scale}V (cogging compensation authority)")
     print(f"Domain randomization: {domain_randomization}")
     print(f"Device: {device}")
     print()
-    print("LQR Configuration (optimal, with Stribeck friction):")
+    print("LQR Configuration (optimal, with cogging torque):")
     print(f"  - Gain scale: {challenge_config.lqr_gain_scale} (optimal)")
-    print(f"  - Friction Ts: {challenge_config.friction.Ts} Nm (stiction)")
+    print(f"  - Cogging amplitude: {challenge_config.cogging.amplitude} Nm")
+    print(f"  - Cogging poles: {challenge_config.cogging.n_poles}")
     print()
-    print("RESEARCH OBJECTIVE: Compensate stiction dead zone")
-    print("  - No-friction LQR: 0.78 deg RMS (target)")
-    print("  - Friction LQR alone: ~1.19 deg RMS (degraded)")
-    print("  - Target: Hybrid <0.9 deg RMS (overcome stiction)")
+    print("RESEARCH OBJECTIVE: Compensate position-dependent cogging")
+    print("  - LQR has K[1]=0 → structurally blind to wheel position")
+    print("  - RL learns α-dependent compensation LQR cannot provide")
     print("=" * 60)
 
     # Create directories
@@ -178,7 +142,6 @@ def train(
         n_envs=n_envs,
     )
 
-    # Wrap with normalization for stable training
     env = VecNormalize(
         env,
         norm_obs=True,
@@ -187,7 +150,7 @@ def train(
         clip_reward=10.0,
     )
 
-    # Create separate eval environment (without domain randomization for consistent evaluation)
+    # Create separate eval environment (without domain randomization)
     eval_env = make_vec_env(
         lambda: make_env(
             0,
@@ -200,12 +163,11 @@ def train(
     eval_env = VecNormalize(
         eval_env,
         norm_obs=True,
-        norm_reward=False,  # Don't normalize reward for evaluation
+        norm_reward=False,
         clip_obs=10.0,
-        training=False,  # Don't update normalization stats during eval
+        training=False,
     )
 
-    # Create PPO model with hyperparameters from config
     model = PPO(
         "MlpPolicy",
         env,
@@ -224,7 +186,7 @@ def train(
                 pi=list(TRAINING_CONFIG.policy_layers),
                 vf=list(TRAINING_CONFIG.value_layers),
             ),
-            activation_fn=nn.Tanh,  # Tanh for easier fixed-point conversion
+            activation_fn=nn.Tanh,
         ),
         verbose=1,
         tensorboard_log=tensorboard_log,
@@ -249,17 +211,15 @@ def train(
         render=False,
     )
 
-    # Plotting callback for learning curves
     plotting_callback = PlottingCallback(
         save_path=save_path,
-        plot_freq=eval_freq,  # Update plot at same frequency as evaluation
+        plot_freq=eval_freq,
         window_size=100,
         verbose=1,
     )
 
     callbacks = CallbackList([checkpoint_callback, eval_callback, plotting_callback])
 
-    # Train the model
     print("\nStarting training...")
     model.learn(
         total_timesteps=total_timesteps,
@@ -280,65 +240,48 @@ def train(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train PPO agent to compensate for Stribeck friction on reaction wheel pendulum"
+        description="Train PPO agent to compensate for cogging torque on reaction wheel pendulum"
     )
     parser.add_argument(
-        "--timesteps",
-        type=int,
-        default=500_000,
+        "--timesteps", type=int, default=500_000,
         help="Total training timesteps (default: 500,000)",
     )
     parser.add_argument(
-        "--n_envs",
-        type=int,
-        default=4,
+        "--n_envs", type=int, default=4,
         help="Number of parallel environments (default: 4)",
     )
     parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=3e-4,
+        "--learning_rate", type=float, default=3e-4,
         help="Learning rate (default: 3e-4)",
     )
     parser.add_argument(
-        "--residual_scale",
-        type=float,
-        default=4.0,
-        help="Max voltage for stiction compensation (default: 4.0V)",
+        "--residual_scale", type=float, default=TRAINING_CONFIG.residual_scale,
+        help=f"Max voltage for cogging compensation (default: {TRAINING_CONFIG.residual_scale}V)",
     )
     parser.add_argument(
-        "--no_domain_rand",
-        action="store_true",
+        "--no_domain_rand", action="store_true",
         help="Disable domain randomization",
     )
     parser.add_argument(
-        "--save_path",
-        type=str,
-        default="models/ppo_residual",
+        "--save_path", type=str, default="models/ppo_residual",
         help="Path to save model (default: models/ppo_residual)",
     )
     parser.add_argument(
-        "--tensorboard_log",
-        type=str,
-        default="./logs/",
+        "--tensorboard_log", type=str, default="./logs/",
         help="Tensorboard log directory (default: ./logs/)",
     )
     parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
+        "--device", type=str, default="auto",
         choices=["auto", "cuda", "mps", "cpu"],
-        help="Device to use for training (default: auto - automatically detect best device)",
+        help="Device to use for training (default: auto)",
     )
     parser.add_argument(
-        "--cpu",
-        action="store_true",
+        "--cpu", action="store_true",
         help="Force CPU usage (shorthand for --device cpu)",
     )
 
     args = parser.parse_args()
 
-    # Determine device
     if args.cpu:
         device = "cpu"
     elif args.device == "auto":

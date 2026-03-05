@@ -1,26 +1,21 @@
 """
 Validation script for comparing LQR vs Hybrid (LQR + Residual RL) control
 
-This script demonstrates that residual RL compensates for Stribeck friction
-(stiction) that degrades optimal LQR performance.
+This script demonstrates that residual RL compensates for cogging torque
+that LQR (with K[1]=0) structurally cannot handle.
 
 RESEARCH CONTEXT:
-- Optimal LQR without friction: 0.78° RMS (target performance)
-- Optimal LQR with Stribeck friction (Ts=0.15): ~1.19° RMS (stiction dead zone)
-- Hybrid (LQR + RL with 4V authority): <0.9° RMS (compensates stiction)
+- Cogging torque is position-dependent: τ_cog = A·sin(N·α)
+- LQR with K[1]=0 has no wheel angle feedback → cannot compensate cogging
+- RL learns α-dependent compensation to recover no-cogging performance
 
 Key Three-Way Comparison:
-1. No-friction LQR (scale=1.0): Target performance (0.78°)
-2. Friction LQR (scale=1.0, Ts=0.15): The problem (1.19°)
-3. Hybrid (LQR + RL with friction): The solution (<0.9°)
+1. No-cogging LQR (scale=1.0): Target performance
+2. Cogging LQR (scale=1.0, A=0.05): The problem
+3. Hybrid (LQR + RL with cogging): The solution
 
 Usage:
     python -m simulation.validate --model_path models/ppo_residual/final_model --episodes 10
-
-Generates:
-    - Time series comparison showing stiction compensation
-    - Phase portraits demonstrating stability
-    - RL residual vs friction torque analysis
 """
 
 import argparse
@@ -41,49 +36,37 @@ def evaluate_lqr_only(
     max_steps: int = 500,
     challenge_config: ChallengeConfig = None,
     seeds: list = None,
+    initial_state: tuple = None,
 ) -> Dict[str, np.ndarray]:
-    """
-    Evaluate pure LQR controller (residual_scale = 0).
-
-    Args:
-        n_episodes: Number of evaluation episodes
-        max_steps: Maximum steps per episode
-        challenge_config: Challenge configuration
-        seeds: List of seeds for reproducible initial conditions
-
-    Returns:
-        Dictionary containing trajectories
-    """
+    """Evaluate pure LQR controller (residual_scale = 0)."""
     print("Evaluating LQR-only control...")
 
     env = ReactionWheelEnv(
-        residual_scale=0.0,  # No residual action
+        residual_scale=0.0,
         domain_randomization=False,
         challenge_config=challenge_config,
     )
 
+    reset_options = {"initial_state": initial_state} if initial_state else None
+
     all_states = []
     all_controls = []
     all_rewards = []
-    all_frictions = []
+    all_cogging = []
 
     for ep in range(n_episodes):
-        states = []
-        controls = []
-        rewards = []
-        frictions = []
+        states, controls, rewards, cogging = [], [], [], []
 
         seed = seeds[ep] if seeds is not None else None
-        obs, _ = env.reset(seed=seed)
+        obs, _ = env.reset(seed=seed, options=reset_options)
         for _ in range(max_steps):
-            # LQR only (residual action = 0)
             action = np.array([0.0])
             obs, reward, terminated, truncated, info = env.step(action)
 
             states.append(obs.copy())
             controls.append(info["u_total"])
             rewards.append(reward)
-            frictions.append(info["friction_torque"])
+            cogging.append(info["cogging_torque"])
 
             if terminated or truncated:
                 break
@@ -91,13 +74,13 @@ def evaluate_lqr_only(
         all_states.append(np.array(states))
         all_controls.append(np.array(controls))
         all_rewards.append(np.array(rewards))
-        all_frictions.append(np.array(frictions))
+        all_cogging.append(np.array(cogging))
 
     return {
         "states": all_states,
         "controls": all_controls,
         "rewards": all_rewards,
-        "frictions": all_frictions,
+        "cogging": all_cogging,
     }
 
 
@@ -107,33 +90,22 @@ def evaluate_hybrid(
     max_steps: int = 500,
     challenge_config: ChallengeConfig = None,
     seeds: list = None,
+    initial_state: tuple = None,
 ) -> Dict[str, np.ndarray]:
-    """
-    Evaluate hybrid control (LQR + Residual RL).
-
-    Args:
-        model_path: Path to trained PPO model
-        n_episodes: Number of evaluation episodes
-        max_steps: Maximum steps per episode
-        challenge_config: Challenge configuration
-        seeds: List of seeds for reproducible initial conditions
-
-    Returns:
-        Dictionary containing trajectories
-    """
+    """Evaluate hybrid control (LQR + Residual RL)."""
     print(f"Evaluating Hybrid control (LQR + RL) from {model_path}...")
 
-    # Load model
     model = PPO.load(model_path)
 
-    # Create raw environment (no VecNormalize wrapper — avoids double-reset seeding bug)
     env = ReactionWheelEnv(
         residual_scale=TRAINING_CONFIG.residual_scale,
         domain_randomization=False,
         challenge_config=challenge_config,
     )
 
-    # Load normalization stats for manual normalization (same path as LQR for seeding)
+    reset_options = {"initial_state": initial_state} if initial_state else None
+
+    # Load normalization stats for manual normalization
     vec_normalize_path = os.path.join(os.path.dirname(model_path), "vec_normalize.pkl")
     obs_mean = None
     obs_var = None
@@ -159,19 +131,13 @@ def evaluate_hybrid(
     all_controls = []
     all_residuals = []
     all_rewards = []
-    all_frictions = []
-    all_gates = []
+    all_cogging = []
 
     for ep in range(n_episodes):
-        states = []
-        controls = []
-        residuals = []
-        rewards = []
-        frictions = []
-        gates = []
+        states, controls, residuals, rewards, cogging = [], [], [], [], []
 
         seed = seeds[ep] if seeds is not None else None
-        obs, _ = env.reset(seed=seed)
+        obs, _ = env.reset(seed=seed, options=reset_options)
         obs_normalized = normalize_obs(obs)
 
         for _ in range(max_steps):
@@ -183,8 +149,7 @@ def evaluate_hybrid(
             controls.append(info["u_total"])
             residuals.append(info["u_RL"])
             rewards.append(reward)
-            frictions.append(info["friction_torque"])
-            gates.append(info["gate"])
+            cogging.append(info["cogging_torque"])
 
             if terminated or truncated:
                 break
@@ -193,43 +158,31 @@ def evaluate_hybrid(
         all_controls.append(np.array(controls))
         all_residuals.append(np.array(residuals))
         all_rewards.append(np.array(rewards))
-        all_frictions.append(np.array(frictions))
-        all_gates.append(np.array(gates))
+        all_cogging.append(np.array(cogging))
 
     return {
         "states": all_states,
         "controls": all_controls,
         "residuals": all_residuals,
         "rewards": all_rewards,
-        "frictions": all_frictions,
-        "gates": all_gates,
+        "cogging": all_cogging,
     }
 
 
 def plot_comparison(
     lqr_results: Dict[str, np.ndarray],
     hybrid_results: Dict[str, np.ndarray],
-    lqr_no_friction_results: Optional[Dict[str, np.ndarray]] = None,
+    lqr_no_cogging_results: Optional[Dict[str, np.ndarray]] = None,
     save_path: str = "validation_plots.png",
     show_plot: bool = True,
 ):
-    """
-    Create comparison plots between LQR and Hybrid control.
-
-    Args:
-        lqr_results: Results from LQR-only evaluation (with friction)
-        hybrid_results: Results from hybrid evaluation
-        lqr_no_friction_results: Optional baseline results without friction
-        save_path: Path to save plot
-        show_plot: Whether to display the plot
-    """
+    """Create comparison plots between LQR and Hybrid control."""
     print("Creating comparison plots...")
 
     dt = 0.02
     fig, axes = plt.subplots(3, 2, figsize=(14, 12))
-    fig.suptitle("Stiction Compensation: LQR with Friction vs Hybrid Control", fontsize=14, fontweight='bold')
+    fig.suptitle("Cogging Compensation: LQR vs Hybrid Control", fontsize=14, fontweight='bold')
 
-    # Plot first episode from each
     lqr_states = lqr_results["states"][0]
     hybrid_states = hybrid_results["states"][0]
     lqr_controls = lqr_results["controls"][0]
@@ -238,16 +191,15 @@ def plot_comparison(
     time_lqr = np.arange(len(lqr_states)) * dt
     time_hybrid = np.arange(len(hybrid_states)) * dt
 
-    # Include baseline if available
-    if lqr_no_friction_results is not None:
-        baseline_states = lqr_no_friction_results["states"][0]
+    if lqr_no_cogging_results is not None:
+        baseline_states = lqr_no_cogging_results["states"][0]
         time_baseline = np.arange(len(baseline_states)) * dt
 
     # Row 1: Pendulum angle and velocity
-    if lqr_no_friction_results is not None:
-        axes[0, 0].plot(time_baseline, baseline_states[:, 0], label="No-friction LQR (target)",
+    if lqr_no_cogging_results is not None:
+        axes[0, 0].plot(time_baseline, baseline_states[:, 0], label="No-cogging LQR (target)",
                         color="C2", linewidth=1.5, alpha=0.7)
-    axes[0, 0].plot(time_lqr, lqr_states[:, 0], label="Friction LQR", color="C0", linewidth=2)
+    axes[0, 0].plot(time_lqr, lqr_states[:, 0], label="Cogging LQR", color="C0", linewidth=2)
     axes[0, 0].plot(time_hybrid, hybrid_states[:, 0], label="Hybrid (LQR+RL)", color="C1", linewidth=2, linestyle="--")
     axes[0, 0].set_ylabel("Pendulum Angle θ (rad)", fontsize=11)
     axes[0, 0].set_xlabel("Time (s)")
@@ -256,10 +208,10 @@ def plot_comparison(
     axes[0, 0].axhline(0, color='k', linestyle=':', linewidth=1, alpha=0.5)
     axes[0, 0].set_title("Pendulum Angle")
 
-    if lqr_no_friction_results is not None:
-        axes[0, 1].plot(time_baseline, baseline_states[:, 2], label="No-friction LQR (target)",
+    if lqr_no_cogging_results is not None:
+        axes[0, 1].plot(time_baseline, baseline_states[:, 2], label="No-cogging LQR (target)",
                         color="C2", linewidth=1.5, alpha=0.7)
-    axes[0, 1].plot(time_lqr, lqr_states[:, 2], label="Friction LQR", color="C0", linewidth=2)
+    axes[0, 1].plot(time_lqr, lqr_states[:, 2], label="Cogging LQR", color="C0", linewidth=2)
     axes[0, 1].plot(time_hybrid, hybrid_states[:, 2], label="Hybrid (LQR+RL)", color="C1", linewidth=2, linestyle="--")
     axes[0, 1].set_ylabel("Pendulum Velocity θ̇ (rad/s)", fontsize=11)
     axes[0, 1].set_xlabel("Time (s)")
@@ -269,10 +221,10 @@ def plot_comparison(
     axes[0, 1].set_title("Pendulum Angular Velocity")
 
     # Row 2: Wheel velocity and control signal
-    if lqr_no_friction_results is not None:
-        axes[1, 0].plot(time_baseline, baseline_states[:, 3], label="No-friction LQR (target)",
+    if lqr_no_cogging_results is not None:
+        axes[1, 0].plot(time_baseline, baseline_states[:, 3], label="No-cogging LQR (target)",
                         color="C2", linewidth=1.5, alpha=0.7)
-    axes[1, 0].plot(time_lqr, lqr_states[:, 3], label="Friction LQR", color="C0", linewidth=2)
+    axes[1, 0].plot(time_lqr, lqr_states[:, 3], label="Cogging LQR", color="C0", linewidth=2)
     axes[1, 0].plot(time_hybrid, hybrid_states[:, 3], label="Hybrid (LQR+RL)", color="C1", linewidth=2, linestyle="--")
     axes[1, 0].set_ylabel("Wheel Velocity α̇ (rad/s)", fontsize=11)
     axes[1, 0].set_xlabel("Time (s)")
@@ -281,30 +233,30 @@ def plot_comparison(
     axes[1, 0].axhline(0, color='k', linestyle=':', linewidth=1, alpha=0.5)
     axes[1, 0].set_title("Wheel Angular Velocity")
 
-    axes[1, 1].plot(time_lqr, lqr_controls, label="Friction LQR", color="C0", linewidth=2)
+    axes[1, 1].plot(time_lqr, lqr_controls, label="Cogging LQR", color="C0", linewidth=2)
     axes[1, 1].plot(time_hybrid, hybrid_controls, label="Hybrid (LQR+RL)", color="C1", linewidth=2, linestyle="--")
     axes[1, 1].set_ylabel("Total Control Signal u (V)", fontsize=11)
     axes[1, 1].set_xlabel("Time (s)")
     axes[1, 1].legend(loc='upper right')
     axes[1, 1].grid(True, alpha=0.3)
     axes[1, 1].axhline(0, color='k', linestyle=':', linewidth=1, alpha=0.5)
-    axes[1, 1].axhline(12, color='r', linestyle=':', linewidth=1, alpha=0.3, label='Saturation')
+    axes[1, 1].axhline(12, color='r', linestyle=':', linewidth=1, alpha=0.3)
     axes[1, 1].axhline(-12, color='r', linestyle=':', linewidth=1, alpha=0.3)
     axes[1, 1].set_title("Control Voltage")
 
-    # Row 3: Residual action and friction torque comparison
+    # Row 3: RL torque vs cogging torque, and performance summary
     if "residuals" in hybrid_results:
         hybrid_residuals = hybrid_results["residuals"][0]
-        hybrid_frictions = hybrid_results["frictions"][0]
+        hybrid_cogging = hybrid_results["cogging"][0]
 
-        # Convert RL voltage to torque for fair comparison: τ_RL = Kt * V_RL / Rm
         from simulation.config import PHYSICAL_PARAMS as _PP
         tau_RL = hybrid_residuals * _PP.Kt / _PP.Rm
 
         axes[2, 0].plot(time_hybrid, tau_RL, label="RL Torque (Kt·u_RL/Rm)", color="C1", linewidth=2)
-        axes[2, 0].plot(time_hybrid, hybrid_frictions, label="Friction Torque τ_f", color="C3", linewidth=1.5, alpha=0.7)
+        axes[2, 0].plot(time_hybrid, hybrid_cogging, label="Cogging Torque τ_cog", color="C3", linewidth=1.5, alpha=0.7)
         axes[2, 0].axhline(_PP.Kt * TRAINING_CONFIG.residual_scale / _PP.Rm, color="C1",
-                           linestyle=':', linewidth=1, alpha=0.4, label=f"Max RL torque ({_PP.Kt * TRAINING_CONFIG.residual_scale / _PP.Rm:.3f} Nm)")
+                           linestyle=':', linewidth=1, alpha=0.4,
+                           label=f"Max RL torque ({_PP.Kt * TRAINING_CONFIG.residual_scale / _PP.Rm:.3f} Nm)")
         axes[2, 0].axhline(-_PP.Kt * TRAINING_CONFIG.residual_scale / _PP.Rm, color="C1",
                            linestyle=':', linewidth=1, alpha=0.4)
         axes[2, 0].set_ylabel("Torque (Nm)", fontsize=11)
@@ -312,7 +264,7 @@ def plot_comparison(
         axes[2, 0].legend(loc='lower right', fontsize=9)
         axes[2, 0].grid(True, alpha=0.3)
         axes[2, 0].axhline(0, color='k', linestyle=':', linewidth=1, alpha=0.5)
-        axes[2, 0].set_title("RL Torque vs Friction Torque")
+        axes[2, 0].set_title("RL Torque vs Cogging Torque")
 
     # Performance comparison bar chart
     lqr_rms = [np.sqrt(np.mean(states[:, 0]**2)) for states in lqr_results["states"]]
@@ -320,7 +272,6 @@ def plot_comparison(
     lqr_lengths = [len(states) for states in lqr_results["states"]]
     hybrid_lengths = [len(states) for states in hybrid_results["states"]]
 
-    # Create grouped bar chart
     x = np.arange(2)
     width = 0.35
 
@@ -335,11 +286,10 @@ def plot_comparison(
     ax2.set_ylabel('RMS Angle Error (rad)', fontsize=11)
     ax2_twin.set_ylabel('Episode Length (steps)', fontsize=11)
     ax2.set_xticks(x)
-    ax2.set_xticklabels(['Friction\nLQR', 'Hybrid\n(LQR+RL)'])
+    ax2.set_xticklabels(['Cogging\nLQR', 'Hybrid\n(LQR+RL)'])
     ax2.set_title("Performance Summary")
     ax2.grid(True, alpha=0.3, axis='y')
 
-    # Add value labels on bars
     for bar, val in zip(bars1, [np.mean(lqr_rms), np.mean(hybrid_rms)]):
         ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
                 f'{val:.3f}', ha='center', va='bottom', fontsize=9)
@@ -363,21 +313,12 @@ def plot_phase_portrait(
     save_path: str = "phase_portrait.png",
     show_plot: bool = True,
 ):
-    """
-    Create phase portrait plots showing system stability.
-
-    Args:
-        lqr_results: Results from LQR-only evaluation
-        hybrid_results: Results from hybrid evaluation
-        save_path: Path to save plot
-        show_plot: Whether to display the plot
-    """
+    """Create phase portrait plots showing system stability."""
     print("Creating phase portrait plots...")
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     fig.suptitle("Phase Portraits: θ vs θ̇ (Stability Analysis)", fontsize=14, fontweight='bold')
 
-    # LQR phase portrait
     for i, states in enumerate(lqr_results["states"]):
         alpha = 0.3 if i > 0 else 1.0
         lw = 1 if i > 0 else 2
@@ -385,13 +326,12 @@ def plot_phase_portrait(
     axes[0].scatter([0], [0], color='green', s=100, zorder=5, marker='*', label='Target (upright)')
     axes[0].set_xlabel("θ (rad)", fontsize=11)
     axes[0].set_ylabel("θ̇ (rad/s)", fontsize=11)
-    axes[0].set_title("Friction LQR (Stiction-Degraded)")
+    axes[0].set_title("Cogging LQR (Degraded)")
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
     axes[0].set_xlim([-1.2, 1.2])
     axes[0].set_ylim([-10, 10])
 
-    # Hybrid phase portrait
     for i, states in enumerate(hybrid_results["states"]):
         alpha = 0.3 if i > 0 else 1.0
         lw = 1 if i > 0 else 2
@@ -399,7 +339,7 @@ def plot_phase_portrait(
     axes[1].scatter([0], [0], color='green', s=100, zorder=5, marker='*', label='Target (upright)')
     axes[1].set_xlabel("θ (rad)", fontsize=11)
     axes[1].set_ylabel("θ̇ (rad/s)", fontsize=11)
-    axes[1].set_title("Hybrid Control (Stiction Compensated)")
+    axes[1].set_title("Hybrid Control (Cogging Compensated)")
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
     axes[1].set_xlim([-1.2, 1.2])
@@ -416,29 +356,27 @@ def plot_phase_portrait(
 
 
 def print_metrics(lqr_results: Dict, hybrid_results: Dict):
-    """Print performance metrics demonstrating stiction compensation."""
+    """Print performance metrics demonstrating cogging compensation."""
     dt = 0.02
 
     print("\n" + "=" * 60)
-    print("STICTION COMPENSATION RESULTS")
+    print("COGGING COMPENSATION RESULTS")
     print("=" * 60)
 
-    # RMS angle error
     lqr_rms = [np.sqrt(np.mean(states[:, 0]**2)) for states in lqr_results["states"]]
     hybrid_rms = [np.sqrt(np.mean(states[:, 0]**2)) for states in hybrid_results["states"]]
 
     print("\nRMS Angle Error (full episode):")
-    print(f"  Friction LQR:    {np.mean(lqr_rms):.4f} ± {np.std(lqr_rms):.4f} rad ({np.degrees(np.mean(lqr_rms)):.2f}°)")
+    print(f"  Cogging LQR:     {np.mean(lqr_rms):.4f} ± {np.std(lqr_rms):.4f} rad ({np.degrees(np.mean(lqr_rms)):.2f}°)")
     print(f"  Hybrid (LQR+RL): {np.mean(hybrid_rms):.4f} ± {np.std(hybrid_rms):.4f} rad ({np.degrees(np.mean(hybrid_rms)):.2f}°)")
     print(f"  Improvement: {(1 - np.mean(hybrid_rms)/np.mean(lqr_rms))*100:.1f}%")
 
     # Transient vs steady-state breakdown
-    transient_steps = int(2.0 / dt)  # first 2s
-    steady_steps = int(2.0 / dt)     # last 2s
+    transient_steps = int(2.0 / dt)
+    steady_steps = int(2.0 / dt)
 
     def phase_metrics(results, label):
-        trans_abs = []
-        steady_abs = []
+        trans_abs, steady_abs = [], []
         for states in results["states"]:
             if len(states) > transient_steps:
                 trans_abs.append(np.mean(np.abs(states[:transient_steps, 0])))
@@ -451,36 +389,25 @@ def print_metrics(lqr_results: Dict, hybrid_results: Dict):
             print(f"    Last 2s  mean |θ|: {np.degrees(np.mean(steady_abs)):.3f}°")
 
     print("\nTransient vs Steady-State Breakdown:")
-    phase_metrics(lqr_results, "Friction LQR")
+    phase_metrics(lqr_results, "Cogging LQR")
     phase_metrics(hybrid_results, "Hybrid (LQR+RL)")
 
-    # RL residual stats in last 2s
+    # RL residual stats
     if "residuals" in hybrid_results:
         steady_u_rl = []
-        steady_u_rl_std = []
         for residuals in hybrid_results["residuals"]:
             if len(residuals) > steady_steps:
                 tail = residuals[-steady_steps:]
                 steady_u_rl.append(np.mean(np.abs(tail)))
-                steady_u_rl_std.append(np.std(tail))
         if steady_u_rl:
-            print(f"\n  Hybrid last 2s |u_RL|: {np.mean(steady_u_rl):.3f}V (std: {np.mean(steady_u_rl_std):.3f}V)")
-
-    # Gate stats
-    if "gates" in hybrid_results:
-        steady_gates = []
-        for gates in hybrid_results["gates"]:
-            if len(gates) > steady_steps:
-                steady_gates.append(np.mean(gates[-steady_steps:]))
-        if steady_gates:
-            print(f"  Hybrid last 2s mean gate: {np.mean(steady_gates):.4f}")
+            print(f"\n  Hybrid last 2s |u_RL|: {np.mean(steady_u_rl):.3f}V")
 
     # Total reward
     lqr_reward = [np.sum(rewards) for rewards in lqr_results["rewards"]]
     hybrid_reward = [np.sum(rewards) for rewards in hybrid_results["rewards"]]
 
     print("\nTotal Reward:")
-    print(f"  Friction LQR:    {np.mean(lqr_reward):.2f} ± {np.std(lqr_reward):.2f}")
+    print(f"  Cogging LQR:     {np.mean(lqr_reward):.2f} ± {np.std(lqr_reward):.2f}")
     print(f"  Hybrid (LQR+RL): {np.mean(hybrid_reward):.2f} ± {np.std(hybrid_reward):.2f}")
 
     # Episode length
@@ -488,7 +415,7 @@ def print_metrics(lqr_results: Dict, hybrid_results: Dict):
     hybrid_length = [len(states) for states in hybrid_results["states"]]
 
     print("\nEpisode Length (both should be max = stable):")
-    print(f"  Friction LQR:    {np.mean(lqr_length):.1f} ± {np.std(lqr_length):.1f} steps")
+    print(f"  Cogging LQR:     {np.mean(lqr_length):.1f} ± {np.std(lqr_length):.1f} steps")
     print(f"  Hybrid (LQR+RL): {np.mean(hybrid_length):.1f} ± {np.std(hybrid_length):.1f} steps")
 
     print("=" * 60)
@@ -496,117 +423,88 @@ def print_metrics(lqr_results: Dict, hybrid_results: Dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Validate and compare LQR vs Hybrid control"
+        description="Validate and compare LQR vs Hybrid control for cogging compensation"
     )
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        default="models/ppo_residual/final_model",
-        help="Path to trained model",
-    )
-    parser.add_argument(
-        "--episodes",
-        type=int,
-        default=50,
-        help="Number of evaluation episodes",
-    )
-    parser.add_argument(
-        "--max_steps",
-        type=int,
-        default=500,
-        help="Maximum steps per episode",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="validation_results",
-        help="Directory to save plots",
-    )
-    parser.add_argument(
-        "--no_show",
-        action="store_true",
-        help="Don't display plots (only save to files)",
-    )
+    parser.add_argument("--model_path", type=str, default="models/ppo_residual/final_model")
+    parser.add_argument("--episodes", type=int, default=50)
+    parser.add_argument("--max_steps", type=int, default=500)
+    parser.add_argument("--output_dir", type=str, default="validation_results")
+    parser.add_argument("--no_show", action="store_true")
 
     args = parser.parse_args()
 
-    # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Challenge configuration - stiction compensation scenario
-    challenge_config = ChallengeConfig.friction_compensation()
+    challenge_config = ChallengeConfig.cogging_compensation()
     baseline_config = ChallengeConfig.optimal_lqr_baseline()
 
     print("\n" + "=" * 60)
-    print("VALIDATION: Stiction Compensation via Residual RL")
+    print("VALIDATION: Cogging Torque Compensation via Residual RL")
     print("=" * 60)
-    print("\nFriction LQR Configuration:")
+    print("\nCogging LQR Configuration:")
     print(f"  - LQR gain scale: {challenge_config.lqr_gain_scale} (optimal)")
-    print(f"  - Friction Ts: {challenge_config.friction.Ts} Nm (stiction)")
-    print("\nNo-friction Baseline:")
-    print(f"  - LQR gain scale: {baseline_config.lqr_gain_scale} (optimal, no friction)")
-    print("\nGoal: RL compensates stiction to recover no-friction performance.")
+    print(f"  - Cogging amplitude: {challenge_config.cogging.amplitude} Nm")
+    print(f"  - Cogging poles: {challenge_config.cogging.n_poles}")
+    print("\nNo-cogging Baseline:")
+    print(f"  - LQR gain scale: {baseline_config.lqr_gain_scale} (optimal, no cogging)")
+    print("\nGoal: RL compensates position-dependent cogging that LQR (K[1]=0) cannot.")
 
-    # Generate shared seeds so all controllers start from identical initial conditions
-    rng = np.random.default_rng(42)
-    seeds = [int(rng.integers(0, 2**31)) for _ in range(args.episodes)]
+    worst_case_ic = (0.05, 0.0, 0.0, 0.0)
+    print(f"\nFixed IC: theta={worst_case_ic[0]} rad ({np.degrees(worst_case_ic[0]):.1f}°)")
 
-    # 1. Evaluate no-friction LQR (target - this is what we want to achieve)
-    print("\n[1/4] Evaluating no-friction LQR (scale=1.0, target performance)...")
-    lqr_no_friction_results = evaluate_lqr_only(
-        n_episodes=args.episodes,
+    # 1. No-cogging LQR baseline
+    print("\n[1/4] Evaluating no-cogging LQR (target performance)...")
+    lqr_no_cogging_results = evaluate_lqr_only(
+        n_episodes=1,
         max_steps=args.max_steps,
         challenge_config=baseline_config,
-        seeds=seeds,
+        seeds=[42],
+        initial_state=worst_case_ic,
     )
 
-    # 2. Evaluate friction LQR (should show degraded performance)
-    print("\n[2/4] Evaluating friction LQR (scale=1.0, Ts=0.15, expect degradation)...")
+    # 2. Cogging LQR (should show degradation)
+    print("\n[2/4] Evaluating cogging LQR (expect degradation)...")
     lqr_results = evaluate_lqr_only(
-        n_episodes=args.episodes,
+        n_episodes=1,
         max_steps=args.max_steps,
         challenge_config=challenge_config,
-        seeds=seeds,
+        seeds=[42],
+        initial_state=worst_case_ic,
     )
 
-    # 3. Evaluate Hybrid control (should compensate stiction)
+    # 3. Hybrid control
     if os.path.exists(args.model_path + ".zip"):
-        print("\n[3/4] Evaluating Hybrid control (LQR + RL stiction compensation)...")
+        print("\n[3/4] Evaluating Hybrid control (LQR + RL cogging compensation)...")
         hybrid_results = evaluate_hybrid(
             model_path=args.model_path,
-            n_episodes=args.episodes,
+            n_episodes=1,
             max_steps=args.max_steps,
             challenge_config=challenge_config,
-            seeds=seeds,
+            seeds=[42],
+            initial_state=worst_case_ic,
         )
 
-        # Print metrics
         print("\n[4/4] Computing metrics and generating plots...")
         print_metrics(lqr_results, hybrid_results)
 
-        # Also print baseline metrics (no-friction LQR - target performance)
-        baseline_lengths = [len(s) for s in lqr_no_friction_results["states"]]
-        baseline_rms = [np.sqrt(np.mean(s[:, 0]**2)) for s in lqr_no_friction_results["states"]]
-        print("\nNo-friction Baseline (target performance):")
-        print(f"  Episode Length: {np.mean(baseline_lengths):.1f} ± {np.std(baseline_lengths):.1f} steps")
-        print(f"  RMS Error: {np.mean(baseline_rms):.4f} ± {np.std(baseline_rms):.4f} rad ({np.degrees(np.mean(baseline_rms)):.2f}°)")
-        print("\nCONCLUSION: Hybrid overcomes stiction to recover no-friction performance!")
-        print("The RL provides supplemental torque to break through stiction dead zones.")
+        baseline_length = len(lqr_no_cogging_results["states"][0])
+        baseline_rms = np.sqrt(np.mean(lqr_no_cogging_results["states"][0][:, 0]**2))
+        print("\nNo-cogging Baseline (target performance):")
+        print(f"  Episode Length: {baseline_length} steps")
+        print(f"  RMS Error: {baseline_rms:.4f} rad ({np.degrees(baseline_rms):.2f}°)")
+        print("\nCONCLUSION: Hybrid compensates position-dependent cogging that LQR cannot!")
         print("=" * 60)
 
-        # Generate plots
         show = not args.no_show
 
-        # Main comparison plot
         plot_comparison(
             lqr_results,
             hybrid_results,
-            lqr_no_friction_results=lqr_no_friction_results,
+            lqr_no_cogging_results=lqr_no_cogging_results,
             save_path=os.path.join(args.output_dir, "comparison_plots.png"),
             show_plot=show,
         )
 
-        # Phase portrait plot
         plot_phase_portrait(
             lqr_results,
             hybrid_results,
@@ -615,14 +513,12 @@ def main():
         )
 
         print(f"\nAll plots saved to: {args.output_dir}/")
-        print("  - comparison_plots.png: Time series comparison")
-        print("  - phase_portrait.png: Stability analysis")
 
     else:
         print(f"\nError: Model not found at {args.model_path}.zip")
         print("Please train a model first using: python -m simulation.train")
-        print("\nBaseline results (LQR without friction):")
-        baseline_lengths = [len(s) for s in lqr_no_friction_results["states"]]
+        print("\nBaseline results (LQR without cogging):")
+        baseline_lengths = [len(s) for s in lqr_no_cogging_results["states"]]
         print(f"  Episode Length: {np.mean(baseline_lengths):.1f} steps (max: {args.max_steps})")
 
 

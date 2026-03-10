@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ESP32Encoder.h>
 #include "defines.h"
+#include "rl_policy.h"
 
 // Definições de pinos (ajuste conforme sua conexão)
 #define ENC_RODA_A 17
@@ -48,6 +49,7 @@ static const estados_t K{
 //   .x4 = -0.086414484249118f
 // };
 bool enable_cont = false;
+bool enable_rl = true;  // Toggle RL residual (set false for pure LQR)
 void enable_cont_ISR(){
   enable_cont = !enable_cont;
 }
@@ -191,7 +193,7 @@ void setup() {
   xTaskCreatePinnedToCore(
     taskControle,
     "TaskControle",
-    1000,
+    4096,  // Increased for RL inference stack (~300B for hidden layers)
     NULL,
     1,
     &handleControle,
@@ -226,6 +228,11 @@ void taskControle(void* pvParameteres){
         estados.x1 = ajusta_angulo(enc_pend.getCount() * en2rad_pend);
 
         double u = controle(estados, K);
+
+        // Residual RL: cogging torque compensation
+        if(enable_rl) {
+          u += rl_inference(estados.x1, estados.x2, estados.x3, estados.x4);
+        }
 
         if(abs(u) > 12) u = sign(u)*12;
         if(!enable_cont) u=0.0f;

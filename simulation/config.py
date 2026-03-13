@@ -6,7 +6,7 @@ for easy modification and consistency across training and validation.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 
 # =============================================================================
@@ -41,6 +41,9 @@ class PhysicalParams:
     lambda_damping: float = 0.15060423
     b1: float = 0.0  # Pendulum damping (none)
 
+    # Optional Kv override (None = use computed value from motor specs)
+    kv_override: Optional[float] = None
+
     @property
     def Rm(self) -> float:
         """Motor resistance (Ohm)."""
@@ -66,7 +69,11 @@ class PhysicalParams:
         """Back-EMF constant V/(rad/s), from no-load motor specs.
 
         V = Kv*ω + I_noload*Rm  →  Kv = (V - I_noload*Rm) / ω_noload
+
+        If kv_override is set, returns that value instead.
         """
+        if self.kv_override is not None:
+            return self.kv_override
         w_noload = self.w_noload_rpm * 2.0 * 3.141592653589793 / 60.0
         return (self.max_voltage - self.i_noload * self.Rm) / w_noload
 
@@ -74,6 +81,69 @@ class PhysicalParams:
     def b2(self) -> float:
         """Wheel damping coefficient (N·m·s/rad)."""
         return 2 * self.lambda_damping * (self.Jh + self.Jr)
+
+
+def compute_lqr_gains(
+    params: PhysicalParams = None,
+    Q_diag: Tuple[float, ...] = (1.0, 0.0, 0.1, 0.001),
+    R_val: float = 1.0,
+) -> Tuple[float, float, float, float]:
+    """Compute LQR gains via continuous ARE for the given plant.
+
+    Builds the linearized A, B matrices from PhysicalParams and solves
+    the continuous algebraic Riccati equation.
+
+    The B matrix uses voltage units (not normalized), so the factor of 12
+    in l_3/l_4 is removed: B = [-Kt/(Rm*MrL2_Jh), ...].
+
+    Args:
+        params: Physical parameters (defaults to PHYSICAL_PARAMS).
+        Q_diag: Diagonal of Q weight matrix.
+        R_val: Scalar R weight.
+
+    Returns:
+        Tuple of 4 LQR gains (K1, K2, K3, K4).
+    """
+    import numpy as np
+    from scipy.linalg import solve_continuous_are
+
+    if params is None:
+        params = PHYSICAL_PARAMS
+
+    MrL2_Jh = params.Mr * params.L**2 + params.Jh
+    MhgL_MrgL = params.Mh * params.g * params.d + params.Mr * params.g * params.L
+
+    # A matrix (linearized around theta=0 upright, sin(theta)~theta)
+    l_31 = +MhgL_MrgL / MrL2_Jh
+    l_33 = -params.b1 / MrL2_Jh
+    l_34 = (params.b2 + params.Kt * params.Kv / params.Rm) / MrL2_Jh
+
+    l_41 = -MhgL_MrgL / MrL2_Jh
+    l_43 = params.b1 / MrL2_Jh
+    l_44 = -((MrL2_Jh + params.Jr) * (params.b2 + params.Kt * params.Kv / params.Rm)) / (params.Jr * MrL2_Jh)
+
+    A = np.array([
+        [0,    0, 1,    0],
+        [0,    0, 0,    1],
+        [l_31, 0, l_33, l_34],
+        [l_41, 0, l_43, l_44],
+    ])
+
+    # B matrix in voltage units (no factor of 12)
+    b_3 = -params.Kt / (params.Rm * MrL2_Jh)
+    b_4 = params.Kt * (MrL2_Jh + params.Jr) / (params.Rm * params.Jr * MrL2_Jh)
+
+    B = np.array([[0], [0], [b_3], [b_4]])
+
+    Q = np.diag(Q_diag)
+    R = np.array([[R_val]])
+
+    P = solve_continuous_are(A, B, Q, R)
+    K = np.linalg.solve(R, B.T @ P)
+
+    # Return with same sign convention as base_K in LQRParams:
+    # control law is u = -K·x, so K from ARE is used directly
+    return tuple(K[0])
 
 
 # =============================================================================

@@ -25,6 +25,7 @@ from simulation.config import (
     REWARD_CONFIG,
     CoggingParams,
     ChallengeConfig,
+    PhysicalParams,
 )
 
 
@@ -56,6 +57,8 @@ class ReactionWheelEnv(gym.Env):
         randomization_factor: float = 0.1,
         lqr_gain_scale: float = None,
         challenge_config: Optional[ChallengeConfig] = None,
+        physical_params: Optional[PhysicalParams] = None,
+        lqr_gains: Optional[Tuple[float, float, float, float]] = None,
         render_mode: Optional[str] = None,
     ):
         super().__init__()
@@ -76,35 +79,42 @@ class ReactionWheelEnv(gym.Env):
         # Store base cogging amplitude for domain randomization
         self._base_cogging_amplitude = self.cogging_amplitude
 
+        # Physical parameters: use provided or default
+        params = physical_params if physical_params is not None else PHYSICAL_PARAMS
+        self._physical_params = params
+
         # Environment parameters
         self.dt = dt if dt is not None else ENV_CONFIG.dt
-        self.max_voltage = max_voltage if max_voltage is not None else PHYSICAL_PARAMS.max_voltage
+        self.max_voltage = max_voltage if max_voltage is not None else params.max_voltage
         self.residual_scale = residual_scale
         self.domain_randomization = domain_randomization
         self.randomization_factor = randomization_factor
         self.render_mode = render_mode
 
         # Physical parameters (from config)
-        self.g = PHYSICAL_PARAMS.g
-        self.Mh = PHYSICAL_PARAMS.Mh
-        self.Mr = PHYSICAL_PARAMS.Mr
-        self.L = PHYSICAL_PARAMS.L
-        self.d = PHYSICAL_PARAMS.d
-        self.r = PHYSICAL_PARAMS.r
-        self.r_in = PHYSICAL_PARAMS.r_in
-        self.tau_stall = PHYSICAL_PARAMS.tau_stall
-        self.i_stall = PHYSICAL_PARAMS.i_stall
-        self.Rm = PHYSICAL_PARAMS.Rm
-        self.Kt = PHYSICAL_PARAMS.Kt
-        self.Jh = PHYSICAL_PARAMS.Jh
-        self.Jr = PHYSICAL_PARAMS.Jr
-        self.lambda_damping = PHYSICAL_PARAMS.lambda_damping
-        self.b1 = PHYSICAL_PARAMS.b1
-        self.b2 = PHYSICAL_PARAMS.b2
-        self.Kv = PHYSICAL_PARAMS.Kv
+        self.g = params.g
+        self.Mh = params.Mh
+        self.Mr = params.Mr
+        self.L = params.L
+        self.d = params.d
+        self.r = params.r
+        self.r_in = params.r_in
+        self.tau_stall = params.tau_stall
+        self.i_stall = params.i_stall
+        self.Rm = params.Rm
+        self.Kt = params.Kt
+        self.Jh = params.Jh
+        self.Jr = params.Jr
+        self.lambda_damping = params.lambda_damping
+        self.b1 = params.b1
+        self.b2 = params.b2
+        self.Kv = params.Kv
 
-        # LQR gains - computed for INVERTED pendulum (theta=0 upright)
-        base_K = np.array([-45.0, 0.0, -5.2, -0.62])
+        # LQR gains - use provided or default
+        if lqr_gains is not None:
+            base_K = np.array(lqr_gains)
+        else:
+            base_K = np.array([-45.0, 0.0, -5.2, -0.62])
         self.K = self.lqr_gain_scale * base_K
 
         # Observation space: 4D state [theta, alpha, theta_dot, alpha_dot]
@@ -254,14 +264,15 @@ class ReactionWheelEnv(gym.Env):
     def _randomize_parameters(self):
         """Apply domain randomization to physical parameters."""
         factor = self.randomization_factor
+        params = self._physical_params
 
         # Randomize masses
-        self.Mh = PHYSICAL_PARAMS.Mh * self.np_random.uniform(1 - factor, 1 + factor)
-        self.Mr = PHYSICAL_PARAMS.Mr * self.np_random.uniform(1 - factor, 1 + factor)
+        self.Mh = params.Mh * self.np_random.uniform(1 - factor, 1 + factor)
+        self.Mr = params.Mr * self.np_random.uniform(1 - factor, 1 + factor)
 
         # Randomize lengths
-        self.L = PHYSICAL_PARAMS.L * self.np_random.uniform(1 - factor, 1 + factor)
-        self.d = PHYSICAL_PARAMS.d * self.np_random.uniform(1 - factor, 1 + factor)
+        self.L = params.L * self.np_random.uniform(1 - factor, 1 + factor)
+        self.d = params.d * self.np_random.uniform(1 - factor, 1 + factor)
 
         # Recalculate inertias
         self.Jh = (1/3) * self.Mh * self.L**2

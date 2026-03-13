@@ -187,10 +187,13 @@ u_total = u_LQR + u_RL
 u_total = clip(u_total, -12V, +12V)
 ```
 
+**Default motor model:** Unless otherwise specified (e.g. `--no_back_emf`), the simulation uses Kv=0.285 V/(rad/s) (back-EMF from motor no-load specs) and LQR gains K=[-45.0, 0.0, -5.2, -0.62] computed via scipy ARE for that plant. These are the canonical values for training and validation. If no back-EMF configuration is mentioned, always use these defaults. Use `PhysicalParams(kv_override=0.0)` + `compute_lqr_gains()` for the no-back-EMF variant.
+
 **Physics Implementation:**
 - Non-linear equations of motion for coupled pendulum-wheel system
 - **Motor model with back-EMF**: `tau = Kt*(V - Kv*ω)/Rm`, Kv=0.285 V/(rad/s)
   - Back-EMF damping `Kt*Kv/Rm = 0.00744` is 10.6× stronger than linear damping b2
+  - Kv is configurable via `PhysicalParams(kv_override=...)` for plant variant experiments
 - Linear damping from MATLAB system ID:
   - `b1 = 0` (no pendulum damping)
   - `b2 = 2*λ*(Jh+Jr) ≈ 0.000703 N⋅m⋅s/rad` (wheel damping, λ=0.15060423)

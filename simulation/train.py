@@ -38,7 +38,7 @@ from stable_baselines3.common.vec_env import VecNormalize
 
 from simulation.envs import ReactionWheelEnv
 from simulation.plotting_callback import PlottingCallback
-from simulation.config import ChallengeConfig, TRAINING_CONFIG
+from simulation.config import ChallengeConfig, TRAINING_CONFIG, PhysicalParams, compute_lqr_gains
 
 
 def get_device(force_cpu: bool = False) -> str:
@@ -70,6 +70,8 @@ def make_env(
     residual_scale: float = TRAINING_CONFIG.residual_scale,
     domain_randomization: bool = TRAINING_CONFIG.domain_randomization,
     challenge_config: ChallengeConfig = None,
+    physical_params: PhysicalParams = None,
+    lqr_gains: tuple = None,
 ):
     """Create a single environment instance."""
     if challenge_config is None:
@@ -81,6 +83,8 @@ def make_env(
             domain_randomization=domain_randomization,
             randomization_factor=TRAINING_CONFIG.randomization_factor,
             challenge_config=challenge_config,
+            physical_params=physical_params,
+            lqr_gains=lqr_gains,
         )
         env.reset(seed=seed + rank)
         return env
@@ -98,6 +102,8 @@ def train(
     eval_freq: int = 10_000,
     checkpoint_freq: int = 50_000,
     device: str = "auto",
+    physical_params: PhysicalParams = None,
+    lqr_gains: tuple = None,
 ):
     """
     Train PPO agent to compensate for cogging torque.
@@ -138,6 +144,8 @@ def train(
             residual_scale=residual_scale,
             domain_randomization=domain_randomization,
             challenge_config=challenge_config,
+            physical_params=physical_params,
+            lqr_gains=lqr_gains,
         )(),
         n_envs=n_envs,
     )
@@ -157,6 +165,8 @@ def train(
             residual_scale=residual_scale,
             domain_randomization=False,
             challenge_config=challenge_config,
+            physical_params=physical_params,
+            lqr_gains=lqr_gains,
         )(),
         n_envs=1,
     )
@@ -279,6 +289,10 @@ def main():
         "--cpu", action="store_true",
         help="Force CPU usage (shorthand for --device cpu)",
     )
+    parser.add_argument(
+        "--no_back_emf", action="store_true",
+        help="Use Kv=0 plant (no back-EMF) with recomputed LQR gains",
+    )
 
     args = parser.parse_args()
 
@@ -289,15 +303,29 @@ def main():
     else:
         device = args.device
 
+    # Handle no-back-EMF configuration
+    physical_params = None
+    lqr_gains = None
+    save_path = args.save_path
+
+    if args.no_back_emf:
+        physical_params = PhysicalParams(kv_override=0.0)
+        lqr_gains = compute_lqr_gains(physical_params)
+        print(f"No back-EMF mode: Kv=0, LQR gains = ({lqr_gains[0]:.2f}, {lqr_gains[1]:.1f}, {lqr_gains[2]:.2f}, {lqr_gains[3]:.4f})")
+        if save_path == "models/ppo_residual":
+            save_path = "models/ppo_no_backemf"
+
     train(
         total_timesteps=args.timesteps,
         n_envs=args.n_envs,
         learning_rate=args.learning_rate,
         residual_scale=args.residual_scale,
         domain_randomization=not args.no_domain_rand,
-        save_path=args.save_path,
+        save_path=save_path,
         tensorboard_log=args.tensorboard_log,
         device=device,
+        physical_params=physical_params,
+        lqr_gains=lqr_gains,
     )
 
 

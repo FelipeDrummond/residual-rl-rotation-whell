@@ -28,7 +28,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 
 from simulation.envs import ReactionWheelEnv
-from simulation.config import ChallengeConfig, TRAINING_CONFIG
+from simulation.config import ChallengeConfig, TRAINING_CONFIG, PhysicalParams, compute_lqr_gains
 
 
 def evaluate_lqr_only(
@@ -37,6 +37,8 @@ def evaluate_lqr_only(
     challenge_config: ChallengeConfig = None,
     seeds: list = None,
     initial_state: tuple = None,
+    physical_params: PhysicalParams = None,
+    lqr_gains: tuple = None,
 ) -> Dict[str, np.ndarray]:
     """Evaluate pure LQR controller (residual_scale = 0)."""
     print("Evaluating LQR-only control...")
@@ -45,6 +47,8 @@ def evaluate_lqr_only(
         residual_scale=0.0,
         domain_randomization=False,
         challenge_config=challenge_config,
+        physical_params=physical_params,
+        lqr_gains=lqr_gains,
     )
 
     reset_options = {"initial_state": initial_state} if initial_state else None
@@ -91,6 +95,8 @@ def evaluate_hybrid(
     challenge_config: ChallengeConfig = None,
     seeds: list = None,
     initial_state: tuple = None,
+    physical_params: PhysicalParams = None,
+    lqr_gains: tuple = None,
 ) -> Dict[str, np.ndarray]:
     """Evaluate hybrid control (LQR + Residual RL)."""
     print(f"Evaluating Hybrid control (LQR + RL) from {model_path}...")
@@ -101,6 +107,8 @@ def evaluate_hybrid(
         residual_scale=TRAINING_CONFIG.residual_scale,
         domain_randomization=False,
         challenge_config=challenge_config,
+        physical_params=physical_params,
+        lqr_gains=lqr_gains,
     )
 
     reset_options = {"initial_state": initial_state} if initial_state else None
@@ -425,15 +433,32 @@ def main():
     parser = argparse.ArgumentParser(
         description="Validate and compare LQR vs Hybrid control for cogging compensation"
     )
-    parser.add_argument("--model_path", type=str, default="models/ppo_residual/final_model")
+    parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--max_steps", type=int, default=500)
-    parser.add_argument("--output_dir", type=str, default="validation_results")
+    parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--no_show", action="store_true")
+    parser.add_argument(
+        "--no_back_emf", action="store_true",
+        help="Use Kv=0 plant (no back-EMF) with recomputed LQR gains",
+    )
 
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Handle no-back-EMF configuration
+    physical_params = None
+    lqr_gains = None
+
+    if args.no_back_emf:
+        physical_params = PhysicalParams(kv_override=0.0)
+        lqr_gains = compute_lqr_gains(physical_params)
+        print(f"No back-EMF mode: Kv=0, LQR gains = ({lqr_gains[0]:.2f}, {lqr_gains[1]:.1f}, {lqr_gains[2]:.2f}, {lqr_gains[3]:.4f})")
+
+    # Set defaults based on mode
+    model_path = args.model_path or ("models/ppo_no_backemf/final_model" if args.no_back_emf else "models/ppo_residual/final_model")
+    output_dir = args.output_dir or ("validation_results_no_backemf" if args.no_back_emf else "validation_results")
+
+    os.makedirs(output_dir, exist_ok=True)
 
     challenge_config = ChallengeConfig.cogging_compensation()
     baseline_config = ChallengeConfig.optimal_lqr_baseline()
@@ -460,6 +485,8 @@ def main():
         challenge_config=baseline_config,
         seeds=[42],
         initial_state=worst_case_ic,
+        physical_params=physical_params,
+        lqr_gains=lqr_gains,
     )
 
     # 2. Cogging LQR (should show degradation)
@@ -470,18 +497,22 @@ def main():
         challenge_config=challenge_config,
         seeds=[42],
         initial_state=worst_case_ic,
+        physical_params=physical_params,
+        lqr_gains=lqr_gains,
     )
 
     # 3. Hybrid control
-    if os.path.exists(args.model_path + ".zip"):
+    if os.path.exists(model_path + ".zip"):
         print("\n[3/4] Evaluating Hybrid control (LQR + RL cogging compensation)...")
         hybrid_results = evaluate_hybrid(
-            model_path=args.model_path,
+            model_path=model_path,
             n_episodes=1,
             max_steps=args.max_steps,
             challenge_config=challenge_config,
             seeds=[42],
             initial_state=worst_case_ic,
+            physical_params=physical_params,
+            lqr_gains=lqr_gains,
         )
 
         print("\n[4/4] Computing metrics and generating plots...")
@@ -501,21 +532,21 @@ def main():
             lqr_results,
             hybrid_results,
             lqr_no_cogging_results=lqr_no_cogging_results,
-            save_path=os.path.join(args.output_dir, "comparison_plots.png"),
+            save_path=os.path.join(output_dir, "comparison_plots.png"),
             show_plot=show,
         )
 
         plot_phase_portrait(
             lqr_results,
             hybrid_results,
-            save_path=os.path.join(args.output_dir, "phase_portrait.png"),
+            save_path=os.path.join(output_dir, "phase_portrait.png"),
             show_plot=show,
         )
 
-        print(f"\nAll plots saved to: {args.output_dir}/")
+        print(f"\nAll plots saved to: {output_dir}/")
 
     else:
-        print(f"\nError: Model not found at {args.model_path}.zip")
+        print(f"\nError: Model not found at {model_path}.zip")
         print("Please train a model first using: python -m simulation.train")
         print("\nBaseline results (LQR without cogging):")
         baseline_lengths = [len(s) for s in lqr_no_cogging_results["states"]]

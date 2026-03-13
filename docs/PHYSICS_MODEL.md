@@ -89,6 +89,10 @@ than the linear damping `b2 ≈ 0.000703 Nm·s/rad`.
 **Note:** The MATLAB model had `Kt=0, Kv=0` (making B=0, uncontrollable).
 The LQR gains in the firmware were computed separately, not from that file.
 
+**Kv configurability:** `PhysicalParams(kv_override=0.0)` sets Kv=0 for the no-back-EMF
+plant variant (matching the MATLAB/firmware model). Use `compute_lqr_gains()` to
+recompute gains for any plant configuration. See `docs/BACKEMF_EXPERIMENT.md` for details.
+
 ### Damping
 ```
 λ = 0.15060423         # Damping coefficient (from lambda.mat)
@@ -280,12 +284,19 @@ The control input `u` is held constant across all sub-steps (zero-order hold), m
 
 ### Optimal LQR Gains
 
-Computed via scipy ARE for the plant **with back-EMF** (Kv=0.285):
+Computed via `compute_lqr_gains()` (scipy ARE) with Q=diag(1, 0, 0.1, 0.001), R=1, voltage-unit B matrix.
+
+**Default plant (Kv=0.285):**
 ```
 K = [-45.0, 0.0, -5.2, -0.62]
 ```
 
-Q = diag(1, 0, 0.1, 0.001), R = 1, voltage-unit B matrix.
+**No-back-EMF plant (Kv=0):**
+```
+K = [-28.91, 0.0, -3.15, -0.068]
+```
+
+Both use the `--no_back_emf` flag in train.py/validate.py to switch between plants.
 
 Control law:
 ```
